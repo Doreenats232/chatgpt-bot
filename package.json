@@ -1,10 +1,11 @@
 {
   "name": "chatgpt-bridge",
   "version": "1.0.0",
-  "description": "ChatGPT browser automation bridge",
+  "description": "Universal AI API Gateway",
   "main": "chatgpt-bot.js",
   "scripts": {
-    "start": "node chatgpt-bot.js"
+    "start": "node chatgpt-bot.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "express": "^4.21.0",
