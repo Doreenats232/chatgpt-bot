@@ -4,7 +4,7 @@
   "main": "chatgpt-bot.js",
   "scripts": {
     "start": "node chatgpt-bot.js",
-    "postinstall": "npx playwright install firefox"
+    "postinstall": "npx playwright install --with-deps firefox"
   },
   "dependencies": {
     "express": "^4.21.0",
