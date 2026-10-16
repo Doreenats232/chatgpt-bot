@@ -2,9 +2,9 @@
   "name": "chatgpt-bridge",
   "version": "1.0.0",
   "description": "ChatGPT browser automation bridge",
-  "main": "server.js",
+  "main": "chatgpt-bot.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node chatgpt-bot.js"
   },
   "dependencies": {
     "express": "^4.21.0",
