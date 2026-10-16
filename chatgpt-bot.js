@@ -1,265 +1,326 @@
+// Nova API Gateway v2 — Playwright + Firefox
 const express = require('express');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 // STATE
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 const apiKeys = new Map();
-const conversations = new Map();
 const stats = { startedAt: Date.now(), errors: 0 };
+const COOKIES_DIR = path.join(__dirname, 'cookies');
+if (!fs.existsSync(COOKIES_DIR)) fs.mkdirSync(COOKIES_DIR, { recursive: true });
 
-// ═══════════════════════════════════════════════════
-// PROVIDERS — all free, no browser needed
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
+// PROVIDERS
+// ═══════════════════════════════════════
 const PROVIDERS = {
-    gemini: {
-        name: 'Gemini 1.5 Flash',
-        model: 'gemini-1.5-flash',
-        icon: 'Ge', color: '#4285f4',
-        desc: 'Google Gemini — 1M context, free',
-        envKey: 'GEMINI_API_KEY',
-        link: 'https://aistudio.google.com/apikey',
-        build: msgs => ({
-            contents: msgs.map(m => ({
-                role: m.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: m.content }]
-            }))
-        }),
-        call: async (key, body) => {
-            const r = await fetch(
-                'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=' + key,
-                { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
-            );
-            if (!r.ok) throw new Error('Gemini ' + r.status + ': ' + await r.text());
-            const d = await r.json();
-            return d.candidates && d.candidates[0] && d.candidates[0].content && d.candidates[0].content.parts[0]
-                ? d.candidates[0].content.parts[0].text : 'No response';
-        }
-    },
-    llama: {
-        name: 'Llama 3.1 70B',
-        model: 'llama-3.1-70b-versatile',
-        icon: 'L', color: '#7c3aed',
-        desc: 'Meta Llama via Groq — ultra fast, free',
-        envKey: 'GROQ_API_KEY',
-        link: 'https://console.groq.com/keys',
-        build: msgs => ({ model: 'llama-3.1-70b-versatile', messages: msgs, max_tokens: 4096 }),
-        call: async (key, body) => {
-            const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-                body: JSON.stringify(body)
-            });
-            if (!r.ok) throw new Error('Groq ' + r.status + ': ' + await r.text());
-            const d = await r.json();
-            return d.choices && d.choices[0] ? d.choices[0].message.content : 'No response';
-        }
-    },
-    mixtral: {
-        name: 'Mixtral 8x7B',
-        model: 'mixtral-8x7b-32768',
-        icon: 'M', color: '#f59e0b',
-        desc: 'Mistral Mixtral via Groq — MoE, free',
-        envKey: 'GROQ_API_KEY',
-        link: 'https://console.groq.com/keys',
-        build: msgs => ({ model: 'mixtral-8x7b-32768', messages: msgs, max_tokens: 4096 }),
-        call: async (key, body) => {
-            const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-                body: JSON.stringify(body)
-            });
-            if (!r.ok) throw new Error('Groq ' + r.status + ': ' + await r.text());
-            const d = await r.json();
-            return d.choices && d.choices[0] ? d.choices[0].message.content : 'No response';
-        }
-    },
-    gemma: {
-        name: 'Gemma 2 9B',
-        model: 'gemma2-9b-it',
-        icon: 'G', color: '#10a37f',
-        desc: 'Google Gemma via Groq — lightweight, free',
-        envKey: 'GROQ_API_KEY',
-        link: 'https://console.groq.com/keys',
-        build: msgs => ({ model: 'gemma2-9b-it', messages: msgs, max_tokens: 4096 }),
-        call: async (key, body) => {
-            const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + key },
-                body: JSON.stringify(body)
-            });
-            if (!r.ok) throw new Error('Groq ' + r.status + ': ' + await r.text());
-            const d = await r.json();
-            return d.choices && d.choices[0] ? d.choices[0].message.content : 'No response';
-        }
-    }
+    chatgpt:    { name: 'ChatGPT',     url: 'https://chatgpt.com/',               color: '#10a37f', icon: 'G',  desc: 'OpenAI GPT-4o' },
+    claude:     { name: 'Claude',      url: 'https://claude.ai/new',               color: '#d97706', icon: 'C',  desc: 'Anthropic Claude 3.5' },
+    gemini:     { name: 'Gemini',      url: 'https://gemini.google.com/app',       color: '#4285f4', icon: 'Ge', desc: 'Google Gemini Pro' },
+    perplexity: { name: 'Perplexity',  url: 'https://www.perplexity.ai/',           color: '#20b2aa', icon: 'P',  desc: 'Perplexity AI' }
 };
 
+const contexts = {};
+const pages = {};
+const busy = {};
 const pState = {};
-Object.keys(PROVIDERS).forEach(function(id) {
-    pState[id] = { connected: false, connectedAt: null, requests: 0 };
+Object.keys(PROVIDERS).forEach(id => {
+    pState[id] = { connectedAt: null, requests: 0 };
+    busy[id] = false;
 });
 
-// ═══════════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════════
+let playwright;
+let firefox;
+
+// ═══════════════════════════════════════
+// BROWSER LAUNCH — Firefox (lighter)
+// ═══════════════════════════════════════
+async function launchProvider(provider) {
+    if (contexts[provider]) return;
+
+    if (!playwright) {
+        playwright = require('playwright');
+        firefox = playwright.firefox;
+    }
+
+    console.log('[*] Launching Firefox for: ' + provider);
+
+    const cookieFile = path.join(COOKIES_DIR, provider + '.json');
+    let storageState;
+    if (fs.existsSync(cookieFile)) {
+        try { storageState = JSON.parse(fs.readFileSync(cookieFile, 'utf8')); } catch {}
+    }
+
+    contexts[provider] = await firefox.launchPersistentContext(
+        path.join(COOKIES_DIR, provider + '-profile'),
+        {
+            headless: true,
+            viewport: { width: 1280, height: 900 },
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+            locale: 'en-US',
+            timezoneId: 'America/New_York',
+            args: [
+                '--disable-extensions',
+                '--disable-background-networking'
+            ],
+            ...(storageState ? {} : {})
+        }
+    );
+
+    const page = contexts[provider].pages()[0] || await contexts[provider].newPage();
+    pages[provider] = page;
+
+    // Load cookies if we have them
+    if (storageState && storageState.cookies) {
+        try {
+            const browserCtx = contexts[provider];
+            await browserCtx.addCookies(storageState.cookies);
+        } catch {}
+    }
+
+    await page.goto(PROVIDERS[provider].url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(3000);
+
+    pState[provider].connectedAt = Date.now();
+    await saveCookies(provider);
+    console.log('[*] ' + provider + ' ready');
+}
+
+async function saveCookies(provider) {
+    try {
+        if (!contexts[provider]) return;
+        const cookies = await contexts[provider].cookies();
+        fs.writeFileSync(
+            path.join(COOKIES_DIR, provider + '.json'),
+            JSON.stringify({ cookies }, null, 2)
+        );
+    } catch {}
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ═══════════════════════════════════════
+// HUMAN TYPING
+// ═══════════════════════════════════════
+async function humanType(page, text) {
+    const sel = '#prompt-textarea, div[contenteditable="true"], textarea, [role="textbox"]';
+    const el = await page.waitForSelector(sel, { timeout: 10000 });
+    await el.click();
+    await sleep(300 + Math.random() * 500);
+    for (const c of text) {
+        await page.keyboard.type(c, { delay: 25 + Math.random() * 100 });
+        if (Math.random() < 0.03) await sleep(150 + Math.random() * 300);
+    }
+}
+
+// ═══════════════════════════════════════
+// WAIT FOR RESPONSE TO STABILIZE
+// ═══════════════════════════════════════
+async function waitForStable(page, getText, maxWait) {
+    let last = '', stable = 0, waited = 0;
+    const limit = maxWait || 90;
+    while (stable < 4 && waited < limit) {
+        await sleep(1500);
+        waited += 1.5;
+        try {
+            const t = await getText();
+            const stop = await page.$('button[aria-label="Stop generating"], button[aria-label="Stop"]');
+            if (t === last && !stop && t.length > 0) stable++;
+            else stable = 0;
+            last = t;
+        } catch { stable = 0; }
+    }
+    return last;
+}
+
+// ═══════════════════════════════════════
+// PROVIDER SEND FUNCTIONS
+// ═══════════════════════════════════════
+async function sendChatGPT(page, msg) {
+    const before = await page.evaluate(() => document.querySelectorAll('div[data-message-author-role="assistant"]').length);
+    await humanType(page, msg);
+    await sleep(200 + Math.random() * 300);
+    try {
+        const btn = await page.waitForSelector('button[data-testid="send-button"], button[aria-label="Send prompt"]', { timeout: 3000 });
+        await btn.click();
+    } catch { await page.keyboard.press('Enter'); }
+    await page.waitForFunction(c => document.querySelectorAll('div[data-message-author-role="assistant"]').length > c, { timeout: 120000 }, before);
+    return await waitForStable(page, () => page.evaluate(() => {
+        const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
+        const l = m[m.length - 1];
+        return l ? l.innerText.trim() : '';
+    }));
+}
+
+async function sendClaude(page, msg) {
+    await humanType(page, msg);
+    await sleep(200 + Math.random() * 300);
+    try {
+        const btn = await page.waitForSelector('button[aria-label="Send Message"], button[aria-label="Send"]', { timeout: 3000 });
+        await btn.click();
+    } catch { await page.keyboard.press('Enter'); }
+    await sleep(3000);
+    return await waitForStable(page, () => page.evaluate(() => {
+        const m = document.querySelectorAll('div[class*="Message"]');
+        const l = m[m.length - 1];
+        return l ? l.innerText.trim() : '';
+    }));
+}
+
+async function sendGemini(page, msg) {
+    await humanType(page, msg);
+    await sleep(200 + Math.random() * 300);
+    try {
+        const btn = await page.waitForSelector('button[aria-label="Send message"], .send-button', { timeout: 3000 });
+        await btn.click();
+    } catch { await page.keyboard.press('Enter'); }
+    await sleep(3000);
+    return await waitForStable(page, () => page.evaluate(() => {
+        const m = document.querySelectorAll('.model-response-text, [class*="response"]');
+        const l = m[m.length - 1];
+        return l ? l.innerText.trim() : '';
+    }));
+}
+
+async function sendPerplexity(page, msg) {
+    await humanType(page, msg);
+    await sleep(200 + Math.random() * 300);
+    try {
+        const btn = await page.waitForSelector('button[aria-label="Submit"], button[type="submit"]', { timeout: 3000 });
+        await btn.click();
+    } catch { await page.keyboard.press('Enter'); }
+    await sleep(3000);
+    return await waitForStable(page, () => page.evaluate(() => {
+        const m = document.querySelectorAll('.prose, [class*="answer"]');
+        const l = m[m.length - 1];
+        return l ? l.innerText.trim() : '';
+    }));
+}
+
+const SENDERS = { chatgpt: sendChatGPT, claude: sendClaude, gemini: sendGemini, perplexity: sendPerplexity };
+
+// ═══════════════════════════════════════
+// API KEY MANAGEMENT
+// ═══════════════════════════════════════
 function makeKey() {
-    var key = 'sk-nova-' + crypto.randomBytes(24).toString('hex');
+    const key = 'sk-nova-' + crypto.randomBytes(24).toString('hex');
     apiKeys.set(key, { created: Date.now(), calls: 0, providers: [], revoked: false });
     return key;
 }
 
-function checkKey(key) {
-    var k = apiKeys.get(key);
-    return k && !k.revoked ? k : null;
-}
-
-function getConv(userKey, provider) {
-    var id = userKey + ':' + provider;
-    if (!conversations.has(id)) conversations.set(id, []);
-    return conversations.get(id);
-}
-
-function clearConv(userKey, provider) {
-    conversations.delete(userKey + ':' + provider);
-}
-
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 // ROUTES
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 
-app.get('/', function(_, res) { res.send(HTML()); });
+app.get('/', (_, res) => res.send(HTML()));
 
-app.get('/v1/providers', function(_, res) {
-    var out = {};
-    Object.keys(PROVIDERS).forEach(function(id) {
-        var p = PROVIDERS[id];
+app.get('/v1/providers', (_, res) => {
+    const out = {};
+    for (const [id, p] of Object.entries(PROVIDERS)) {
         out[id] = {
-            name: p.name, model: p.model, desc: p.desc,
-            icon: p.icon, color: p.color,
-            configured: !!process.env[p.envKey],
-            connected: pState[id].connected,
+            name: p.name, desc: p.desc, color: p.color, icon: p.icon,
+            connected: !!pages[id],
             uptime: pState[id].connectedAt ? Math.floor((Date.now() - pState[id].connectedAt) / 1000) : 0,
             requests: pState[id].requests
         };
-    });
+    }
     res.json(out);
 });
 
-app.post('/v1/providers/:id/init', async function(req, res) {
-    var id = req.params.id;
-    var p = PROVIDERS[id];
-    if (!p) return res.status(400).json({ error: 'Unknown provider' });
-    if (!process.env[p.envKey]) {
-        return res.status(503).json({
-            error: p.name + ' API key not set',
-            fix: 'Set ' + p.envKey + ' in Render Environment tab',
-            link: p.link
-        });
-    }
+app.post('/v1/providers/:id/init', async (req, res) => {
+    const { id } = req.params;
+    if (!PROVIDERS[id]) return res.status(400).json({ error: 'Unknown provider' });
     try {
-        var body = p.build([{ role: 'user', content: 'Say hello in 5 words.' }]);
-        var reply = await p.call(process.env[p.envKey], body);
-        pState[id].connected = true;
-        pState[id].connectedAt = Date.now();
-        res.json({ status: 'connected', provider: id, name: p.name, test: reply.slice(0, 100) });
-    } catch (err) {
-        res.status(500).json({ error: 'Test failed: ' + err.message });
-    }
-});
-
-app.post('/v1/providers/:id/newchat', function(req, res) {
-    var auth = req.headers.authorization;
-    if (!auth) return res.status(401).json({ error: 'Missing auth' });
-    clearConv(auth.replace('Bearer ', ''), req.params.id);
-    res.json({ ok: true });
-});
-
-app.post('/v1/keys', function(_, res) {
-    res.json({ key: makeKey(), message: 'Save this key. It will not be shown again.' });
-});
-
-app.get('/v1/keys', function(_, res) {
-    var out = [];
-    apiKeys.forEach(function(v, k) {
-        out.push({
-            key: k.slice(0, 12) + '...' + k.slice(-4),
-            full: k,
-            created: new Date(v.created).toISOString(),
-            calls: v.calls,
-            providers: v.providers.filter(function(v, i, a) { return a.indexOf(v) === i; }),
-            revoked: v.revoked
-        });
-    });
-    res.json(out);
-});
-
-app.delete('/v1/keys/:key', function(req, res) {
-    if (!apiKeys.has(req.params.key)) return res.status(404).json({ error: 'Not found' });
-    apiKeys.get(req.params.key).revoked = true;
-    res.json({ ok: true });
-});
-
-app.get('/v1/stats', function(_, res) {
-    var totalCalls = 0;
-    apiKeys.forEach(function(v) { totalCalls += v.calls; });
-    var ready = 0;
-    Object.keys(PROVIDERS).forEach(function(id) {
-        if (process.env[PROVIDERS[id].envKey]) ready++;
-    });
-    res.json({
-        totalCalls: totalCalls,
-        totalKeys: apiKeys.size,
-        activeKeys: Array.from(apiKeys.values()).filter(function(v) { return !v.revoked; }).length,
-        readyProviders: ready,
-        totalProviders: Object.keys(PROVIDERS).length,
-        uptime: Math.floor((Date.now() - stats.startedAt) / 1000),
-        errors: stats.errors
-    });
-});
-
-app.post('/v1/chat/:provider', async function(req, res) {
-    var provider = req.params.provider;
-    var message = req.body.message;
-    var auth = req.headers.authorization;
-
-    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing API key' });
-    var userKey = auth.replace('Bearer ', '');
-    var kd = checkKey(userKey);
-    if (!kd) return res.status(403).json({ error: 'Invalid or revoked key' });
-
-    var p = PROVIDERS[provider];
-    if (!p) return res.status(400).json({ error: 'Unknown provider', available: Object.keys(PROVIDERS) });
-    if (!process.env[p.envKey]) return res.status(503).json({ error: p.name + ' not configured on server' });
-    if (!message) return res.status(400).json({ error: 'No message provided' });
-
-    var start = Date.now();
-    try {
-        var conv = getConv(userKey, provider);
-        conv.push({ role: 'user', content: message });
-        while (conv.length > 20) conv.shift();
-
-        var body = p.build(conv);
-        var reply = await p.call(process.env[p.envKey], body);
-        conv.push({ role: 'assistant', content: reply });
-
-        kd.calls++;
-        if (kd.providers.indexOf(provider) === -1) kd.providers.push(provider);
-        pState[provider].requests++;
-
-        res.json({ provider: provider, model: p.name, reply: reply, latency: (Date.now() - start) + 'ms' });
+        await launchProvider(id);
+        res.json({ status: 'connected', provider: id, name: PROVIDERS[id].name });
     } catch (err) {
         stats.errors++;
         res.status(500).json({ error: err.message });
     }
 });
 
-// ═══════════════════════════════════════════════════
+app.post('/v1/providers/:id/newchat', async (req, res) => {
+    const { id } = req.params;
+    if (!pages[id]) return res.status(503).json({ error: 'Not connected' });
+    try {
+        await pages[id].goto(PROVIDERS[id].url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await pages[id].waitForTimeout(2000);
+        res.json({ ok: true });
+    } catch (err) { res.json({ error: err.message }); }
+});
+
+app.post('/v1/keys', (_, res) => {
+    const key = makeKey();
+    res.json({ key, message: 'Save this key. It will not be shown again.' });
+});
+
+app.get('/v1/keys', (_, res) => {
+    const out = [];
+    apiKeys.forEach((v, k) => {
+        out.push({
+            key: k.slice(0, 12) + '...' + k.slice(-4), full: k,
+            created: new Date(v.created).toISOString(),
+            calls: v.calls, providers: v.providers, revoked: v.revoked
+        });
+    });
+    res.json(out);
+});
+
+app.delete('/v1/keys/:key', (req, res) => {
+    if (!apiKeys.has(req.params.key)) return res.status(404).json({ error: 'Not found' });
+    apiKeys.get(req.params.key).revoked = true;
+    res.json({ ok: true });
+});
+
+app.get('/v1/stats', (_, res) => {
+    let totalCalls = 0;
+    apiKeys.forEach(v => totalCalls += v.calls);
+    res.json({
+        totalCalls, totalKeys: apiKeys.size,
+        activeKeys: [...apiKeys.values()].filter(v => !v.revoked).length,
+        connectedProviders: Object.keys(PROVIDERS).filter(k => pages[k]).length,
+        uptime: Math.floor((Date.now() - stats.startedAt) / 1000),
+        errors: stats.errors
+    });
+});
+
+app.post('/v1/chat/:provider', async (req, res) => {
+    const { provider } = req.params;
+    const { message } = req.body;
+    const auth = req.headers.authorization;
+
+    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing API key' });
+    const key = auth.replace('Bearer ', '');
+    const kd = apiKeys.get(key);
+    if (!kd || kd.revoked) return res.status(403).json({ error: 'Invalid or revoked key' });
+    if (!PROVIDERS[provider]) return res.status(400).json({ error: 'Unknown provider', available: Object.keys(PROVIDERS) });
+    if (!pages[provider]) return res.status(503).json({ error: provider + ' not connected. Initialize first.' });
+    if (busy[provider]) return res.status(429).json({ error: provider + ' is busy. Try again.' });
+    if (!message) return res.status(400).json({ error: 'No message' });
+
+    busy[provider] = true;
+    const start = Date.now();
+    try {
+        const reply = await SENDERS[provider](pages[provider], message);
+        await saveCookies(provider);
+        kd.calls++;
+        if (!kd.providers.includes(provider)) kd.providers.push(provider);
+        pState[provider].requests++;
+        res.json({ provider, model: PROVIDERS[provider].name, reply, latency: (Date.now() - start) + 'ms' });
+    } catch (err) {
+        stats.errors++;
+        res.status(500).json({ error: err.message });
+    } finally { busy[provider] = false; }
+});
+
+// ═══════════════════════════════════════
 // HTML DASHBOARD
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 
 function HTML() {
     return '<!DOCTYPE html>\n<html lang="en">\n<head>\n' +
@@ -308,9 +369,6 @@ function HTML() {
     '.stat-card .sub{font-size:11px;color:#555;margin-top:4px}\n' +
     '.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}\n' +
     '.section-head h3{font-size:16px;font-weight:700}\n' +
-    '.alert{background:#f59e0b11;border:1px solid #f59e0b33;border-radius:10px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:12px;font-size:13px}\n' +
-    '.alert-icon{font-size:20px}\n' +
-    '.alert-text strong{color:var(--amber)}\n' +
     '.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:24px}\n' +
     '.p-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;transition:all .2s}\n' +
     '.p-card:hover{border-color:var(--border2);transform:translateY(-2px)}\n' +
@@ -318,16 +376,15 @@ function HTML() {
     '.p-card-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#000;flex-shrink:0}\n' +
     '.p-card-name{font-size:15px;font-weight:700}\n' +
     '.p-card-desc{font-size:12px;color:var(--muted)}\n' +
-    '.p-card-model{font-size:11px;color:#555;font-family:monospace;margin-top:2px}\n' +
     '.p-card-status{display:flex;align-items:center;gap:6px;font-size:12px;margin:12px 0;font-weight:500}\n' +
-    '.p-card-status.ready{color:var(--green)}\n' +
-    '.p-card-status.not-configured{color:#666}\n' +
     '.p-card-status.connected{color:var(--green)}\n' +
+    '.p-card-status.disconnected{color:#666}\n' +
     '.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}\n' +
     '.status-dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}\n' +
     '.status-dot.off{background:#555}\n' +
     '.p-card-meta{font-size:11px;color:#444;margin-bottom:12px}\n' +
-    '.p-card-actions{display:flex;gap:8px}\n' +
+    '.p-card-actions{display:flex;gap:8px;flex-wrap:wrap}\n' +
+    '.p-card-actions .btn:disabled{opacity:.5}\n' +
     '.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:24px}\n' +
     'table{width:100%;border-collapse:collapse}\n' +
     'th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);font-weight:600;padding:12px 16px;border-bottom:1px solid var(--border);background:#0c0c14}\n' +
@@ -354,13 +411,7 @@ function HTML() {
     '.chat-input-wrap textarea:focus{border-color:var(--blue)}\n' +
     '.spinner{display:inline-block;width:13px;height:13px;border:2px solid #1CB7FF44;border-top:2px solid var(--blue);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}\n' +
     '@keyframes spin{to{transform:rotate(360deg)}}\n' +
-    '.setup-step{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:14px}\n' +
-    '.setup-step h4{font-size:14px;font-weight:700;margin-bottom:8px;display:flex;align-items:center;gap:8px}\n' +
-    '.setup-step .num{width:24px;height:24px;background:linear-gradient(135deg,var(--blue),var(--green));border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#000;flex-shrink:0}\n' +
-    '.setup-step p{font-size:13px;color:#888;line-height:1.6;margin-bottom:8px}\n' +
-    '.setup-step code{background:#1a1a28;padding:2px 7px;border-radius:5px;font-size:12px;font-family:monospace;color:#ccc}\n' +
-    '.setup-step a{color:var(--blue);text-decoration:none}\n' +
-    '.setup-step a:hover{text-decoration:underline}\n' +
+    '.loading-btn{pointer-events:none;opacity:.6}\n' +
     '.doc-block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px}\n' +
     '.doc-block .endpoint{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}\n' +
     '.method{padding:3px 10px;border-radius:5px;font-weight:700;font-size:11px;letter-spacing:.5px}\n' +
@@ -370,7 +421,7 @@ function HTML() {
     '.doc-block code{background:#1a1a28;padding:3px 7px;border-radius:5px;font-size:12px;font-family:monospace;color:#ccc}\n' +
     '.doc-block .desc{font-size:13px;color:#888;line-height:1.6}\n' +
     '.doc-block .example{background:#0a0a10;border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:10px;font-family:monospace;font-size:12px;color:#aaa;line-height:1.7;white-space:pre;overflow-x:auto}\n' +
-    '.toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:13px;display:none;z-index:999;animation:fadeIn .2s}\n' +
+    '.toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:13px;display:none;z-index:999;animation:fadeIn .2s;max-width:400px;word-wrap:break-word}\n' +
     '@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}\n' +
     '@media(max-width:768px){.sidebar{width:60px;padding:12px 0}.sb-logo span,.sb-link span,.sb-section{display:none}.sb-link{justify-content:center;padding:10px}.sb-link .badge{display:none}.main{margin-left:60px}.stats-row{grid-template-columns:1fr 1fr}.provider-grid{grid-template-columns:1fr}}\n' +
     '</style>\n</head>\n<body>\n' +
@@ -388,7 +439,7 @@ function HTML() {
     '    <a class="sb-link" data-page="providers" onclick="switchPage(\'providers\')">\n' +
     '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m-7-7H1m22 0h-4m-1.5-7.5L15 7m-6 10l-2.5 2.5M19.5 19.5L17 17M5 5l2.5 2.5"/></svg>\n' +
     '      <span>Providers</span>\n' +
-    '      <span class="badge" id="providerBadge">0</span>\n' +
+    '      <span class="badge" id="connBadge">0</span>\n' +
     '    </a>\n' +
     '    <div class="sb-section">Management</div>\n' +
     '    <a class="sb-link" data-page="keys" onclick="switchPage(\'keys\')">\n' +
@@ -399,10 +450,6 @@ function HTML() {
     '    <a class="sb-link" data-page="playground" onclick="switchPage(\'playground\')">\n' +
     '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>\n' +
     '      <span>Playground</span>\n' +
-    '    </a>\n' +
-    '    <a class="sb-link" data-page="setup" onclick="switchPage(\'setup\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>\n' +
-    '      <span>Setup</span>\n' +
     '    </a>\n' +
     '    <a class="sb-link" data-page="docs" onclick="switchPage(\'docs\')">\n' +
     '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>\n' +
@@ -416,48 +463,40 @@ function HTML() {
     '  <div class="topbar">\n' +
     '    <h2 id="pageTitle">Dashboard</h2>\n' +
     '    <div class="topbar-right">\n' +
-    '      <div class="pill"><span class="dot"></span><span id="readyCount">0</span> Ready</div>\n' +
+    '      <div class="pill"><span class="dot"></span><span id="connCount">0</span> Connected</div>\n' +
     '    </div>\n' +
     '  </div>\n' +
     '  <div class="content">\n' +
 
-    // DASHBOARD PAGE
+    // DASHBOARD
     '    <div class="page active" id="page-dashboard">\n' +
-    '      <div id="setupAlert"></div>\n' +
     '      <div class="stats-row" id="statsRow"></div>\n' +
-    '      <div class="section-head"><h3>Providers</h3></div>\n' +
+    '      <div class="section-head"><h3>Provider Status</h3></div>\n' +
     '      <div class="provider-grid" id="dashProviders"></div>\n' +
     '    </div>\n' +
 
-    // PROVIDERS PAGE
+    // PROVIDERS
     '    <div class="page" id="page-providers">\n' +
-    '      <div class="section-head"><h3>AI Providers</h3><span id="providerCountLabel" style="font-size:12px;color:var(--muted)"></span></div>\n' +
+    '      <div class="section-head"><h3>AI Providers</h3><span id="provCountLabel" style="font-size:12px;color:var(--muted)"></span></div>\n' +
     '      <div class="provider-grid" id="providerGrid"></div>\n' +
     '    </div>\n' +
 
-    // KEYS PAGE
+    // KEYS
     '    <div class="page" id="page-keys">\n' +
-    '      <div class="section-head">\n' +
-    '        <h3>API Keys</h3>\n' +
-    '        <button class="btn btn-primary btn-sm" onclick="generateKey()">+ New Key</button>\n' +
-    '      </div>\n' +
-    '      <div class="table-wrap">\n' +
-    '        <table><thead><tr><th>Key</th><th>Created</th><th>Calls</th><th>Providers</th><th>Status</th><th>Actions</th></tr></thead>\n' +
-    '        <tbody id="keysTableBody"><tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet. Generate one to get started.</td></tr></tbody></table>\n' +
-    '      </div>\n' +
+    '      <div class="section-head"><h3>API Keys</h3><button class="btn btn-primary btn-sm" onclick="generateKey()">+ New Key</button></div>\n' +
+    '      <div class="table-wrap"><table><thead><tr><th>Key</th><th>Created</th><th>Calls</th><th>Providers</th><th>Status</th><th>Actions</th></tr></thead>\n' +
+    '      <tbody id="keysBody"><tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet.</td></tr></tbody></table></div>\n' +
     '    </div>\n' +
 
-    // PLAYGROUND PAGE
+    // PLAYGROUND
     '    <div class="page" id="page-playground">\n' +
     '      <div class="chat-container">\n' +
     '        <div class="chat-header">\n' +
-    '          <select id="chatProvider"></select>\n' +
+    '          <select id="chatProv"></select>\n' +
     '          <button class="btn btn-outline btn-sm" onclick="newChat()">New Chat</button>\n' +
     '          <button class="btn btn-outline btn-sm" onclick="clearChat()">Clear</button>\n' +
     '        </div>\n' +
-    '        <div class="chat-messages" id="chatBox">\n' +
-    '          <div class="msg msg-system">Select a provider and start chatting. Responses come from free AI APIs.</div>\n' +
-    '        </div>\n' +
+    '        <div class="chat-messages" id="chatBox"><div class="msg msg-system">Select a connected provider and start chatting.</div></div>\n' +
     '        <div class="chat-input-wrap">\n' +
     '          <textarea id="chatInput" placeholder="Type a message..." rows="1"></textarea>\n' +
     '          <button class="btn btn-primary" id="sendBtn" onclick="sendMsg()">Send</button>\n' +
@@ -465,324 +504,185 @@ function HTML() {
     '      </div>\n' +
     '    </div>\n' +
 
-    // SETUP PAGE
-    '    <div class="page" id="page-setup">\n' +
-    '      <div class="section-head"><h3>Setup Guide</h3></div>\n' +
-    '      <div class="setup-step">\n' +
-    '        <h4><span class="num">1</span> Get a Gemini API Key (Free)</h4>\n' +
-    '        <p>Go to <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a> and create an API key. No credit card needed. Free tier: 15 requests/min, 1M tokens/day.</p>\n' +
-    '        <p>Then on Render: Environment → Add <code>GEMINI_API_KEY</code> = your key</p>\n' +
-    '        <div id="geminiStatus" style="margin-top:8px;font-size:12px"></div>\n' +
-    '      </div>\n' +
-    '      <div class="setup-step">\n' +
-    '        <h4><span class="num">2</span> Get a Groq API Key (Free)</h4>\n' +
-    '        <p>Go to <a href="https://console.groq.com/keys" target="_blank">Groq Console</a> and create an API key. No credit card needed. Free tier: 30 requests/min. Runs Llama 3.1, Mixtral, and Gemma.</p>\n' +
-    '        <p>Then on Render: Environment → Add <code>GROQ_API_KEY</code> = your key</p>\n' +
-    '        <div id="groqStatus" style="margin-top:8px;font-size:12px"></div>\n' +
-    '      </div>\n' +
-    '      <div class="setup-step">\n' +
-    '        <h4><span class="num">3</span> Redeploy</h4>\n' +
-    '        <p>After adding the environment variables, go to Render → Manual Deploy → Deploy latest commit. The providers will auto-configure on startup.</p>\n' +
-    '      </div>\n' +
-    '    </div>\n' +
-
-    // DOCS PAGE
+    // DOCS
     '    <div class="page" id="page-docs">\n' +
     '      <div class="section-head"><h3>API Reference</h3></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/keys</code></div><div class="desc">Generate a new API key for your users.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/keys\n// Response: { "key": "sk-nova-a1b2c3..." }</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/providers</code></div><div class="desc">List all providers with connection status and model info.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/init</code></div><div class="desc">Test and enable a provider. Replace <code>:provider</code> with <code>gemini</code>, <code>llama</code>, <code>mixtral</code>, or <code>gemma</code>.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/chat/:provider</code></div><div class="desc">Send a message. Supports multi-turn conversations.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/chat/gemini \\\n  -H "Authorization: Bearer sk-nova-YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"message": "Hello!"}\'\n\n// Response:\n{ "provider": "gemini", "model": "Gemini 1.5 Flash",\n  "reply": "Hi! How can I help you?", "latency": "450ms" }</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/newchat</code></div><div class="desc">Clear conversation history for a fresh start.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-delete">DELETE</span> <code>/v1/keys/:key</code></div><div class="desc">Revoke an API key. Calls using it will be rejected.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/stats</code></div><div class="desc">Platform statistics — calls, keys, providers, uptime.</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/keys</code></div><div class="desc">Generate a new API key.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/keys</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/providers</code></div><div class="desc">List providers with connection status and uptime.</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/init</code></div><div class="desc">Connect to a provider (launches browser). Providers: chatgpt, claude, gemini, perplexity.</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/chat/:provider</code></div><div class="desc">Send a message. Requires Authorization header.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/chat/chatgpt \\\n  -H "Authorization: Bearer sk-nova-YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"message": "Hello!"}\'\n\n// Response:\n{ "provider": "chatgpt", "model": "ChatGPT",\n  "reply": "Hi there!", "latency": "3200ms" }</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/newchat</code></div><div class="desc">Start a fresh conversation.</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-delete">DELETE</span> <code>/v1/keys/:key</code></div><div class="desc">Revoke an API key.</div></div>\n' +
+    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/stats</code></div><div class="desc">Platform statistics.</div></div>\n' +
     '    </div>\n' +
 
     '  </div>\n</div>\n</div>\n' +
     '<div class="toast" id="toast"></div>\n' +
 
-    // JAVASCRIPT
+    // JS
     '<script>\n' +
-    'var myKey = localStorage.getItem("nova_key") || "";\n' +
-    'var providers = {};\n' +
-    'var keys = [];\n' +
-    'var pageTitles = {dashboard:"Dashboard",providers:"Providers",keys:"API Keys",playground:"Playground",setup:"Setup Guide",docs:"API Documentation"};\n' +
+    'var myKey=localStorage.getItem("nova_key")||"",providers={},keys=[];\n' +
+    'var titles={dashboard:"Dashboard",providers:"Providers",keys:"API Keys",playground:"Playground",docs:"API Documentation"};\n' +
 
-    'function switchPage(page) {\n' +
-    '  document.querySelectorAll(".page").forEach(function(p){p.classList.remove("active")});\n' +
-    '  document.getElementById("page-"+page).classList.add("active");\n' +
-    '  document.querySelectorAll(".sb-link").forEach(function(l){l.classList.remove("active")});\n' +
-    '  var link = document.querySelector(".sb-link[data-page=\\""+page+"\\"]");\n' +
-    '  if(link) link.classList.add("active");\n' +
-    '  document.getElementById("pageTitle").textContent = pageTitles[page];\n' +
-    '  if(page==="keys") loadKeys();\n' +
-    '  if(page==="providers"||page==="dashboard") loadProviders();\n' +
+    'function switchPage(p){\n' +
+    '  document.querySelectorAll(".page").forEach(function(e){e.classList.remove("active")});\n' +
+    '  document.getElementById("page-"+p).classList.add("active");\n' +
+    '  document.querySelectorAll(".sb-link").forEach(function(e){e.classList.remove("active")});\n' +
+    '  var l=document.querySelector("[data-page=\\""+p+"\\"]");\n' +
+    '  if(l)l.classList.add("active");\n' +
+    '  document.getElementById("pageTitle").textContent=titles[p];\n' +
+    '  if(p==="keys")loadKeys();\n' +
+    '  if(p==="providers"||p==="dashboard")loadProviders();\n' +
     '}\n' +
 
-    'function showToast(msg, color) {\n' +
-    '  var t = document.getElementById("toast");\n' +
-    '  t.textContent = msg;\n' +
-    '  t.style.color = color || "var(--green)";\n' +
-    '  t.style.display = "block";\n' +
-    '  clearTimeout(t._t);\n' +
-    '  t._t = setTimeout(function(){t.style.display="none"},3000);\n' +
-    '}\n' +
+    'function showToast(m,c){var t=document.getElementById("toast");t.textContent=m;t.style.color=c||"var(--green)";t.style.display="block";clearTimeout(t._t);t._t=setTimeout(function(){t.style.display="none"},3000)}\n' +
 
-    'function copyText(text, btn) {\n' +
-    '  navigator.clipboard.writeText(text).then(function(){\n' +
-    '    if(btn){btn.classList.add("copied");btn.textContent="\\u2713";setTimeout(function(){btn.classList.remove("copied");btn.textContent="\\ud83d\\udccb"},1500)}\n' +
-    '    showToast("Copied to clipboard");\n' +
-    '  }).catch(function(){\n' +
-    '    var ta=document.createElement("textarea");ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);\n' +
-    '    showToast("Copied to clipboard");\n' +
-    '  });\n' +
-    '}\n' +
+    'function copyText(text,btn){navigator.clipboard.writeText(text).then(function(){if(btn){btn.classList.add("copied");btn.textContent="\\u2713";setTimeout(function(){btn.classList.remove("copied");btn.textContent="\\ud83d\\udccb"},1500)}showToast("Copied")}).catch(function(){showToast("Copy failed","var(--red)")})}\n' +
 
-    'function fmtUptime(sec) {\n' +
-    '  if(sec<60) return sec+"s";\n' +
-    '  if(sec<3600) return Math.floor(sec/60)+"m "+(sec%60)+"s";\n' +
-    '  return Math.floor(sec/3600)+"h "+Math.floor((sec%3600)/60)+"m";\n' +
-    '}\n' +
-
-    'function fmtDate(ts) {\n' +
-    '  var d = new Date(ts);\n' +
-    '  return d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"});\n' +
-    '}\n' +
+    'function fmtUptime(s){if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m "+(s%60)+"s";return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m"}\n' +
+    'function fmtDate(ts){var d=new Date(ts);return d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"})}\n' +
 
     // LOAD PROVIDERS
-    'async function loadProviders() {\n' +
-    '  try {\n' +
-    '    var res = await fetch("/v1/providers");\n' +
-    '    providers = await res.json();\n' +
-    '    var ready = 0;\n' +
-    '    Object.keys(providers).forEach(function(id){if(providers[id].configured) ready++});\n' +
-    '    document.getElementById("readyCount").textContent = ready;\n' +
-    '    document.getElementById("providerBadge").textContent = ready;\n' +
-    '    renderProviderCards("dashProviders", true);\n' +
-    '    renderProviderCards("providerGrid", false);\n' +
-    '    renderSetupStatus();\n' +
-    '    // Chat provider select\n' +
-    '    var sel = document.getElementById("chatProvider");\n' +
-    '    var cur = sel.value;\n' +
-    '    sel.innerHTML = "";\n' +
-    '    Object.keys(providers).forEach(function(id){\n' +
-    '      var p = providers[id];\n' +
-    '      var opt = document.createElement("option");\n' +
-    '      opt.value = id;\n' +
-    '      opt.textContent = p.name + (p.configured ? " \\u2713" : "");\n' +
-    '      sel.appendChild(opt);\n' +
-    '    });\n' +
-    '    if(cur) sel.value = cur;\n' +
-    '  } catch(e) { console.error(e); }\n' +
+    'async function loadProviders(){\n' +
+    '  try{\n' +
+    '    var res=await fetch("/v1/providers");\n' +
+    '    providers=await res.json();\n' +
+    '    var conn=0;Object.keys(providers).forEach(function(id){if(providers[id].connected)conn++});\n' +
+    '    document.getElementById("connCount").textContent=conn;\n' +
+    '    document.getElementById("connBadge").textContent=conn;\n' +
+    '    renderCards("dashProviders",true);\n' +
+    '    renderCards("providerGrid",false);\n' +
+    '    var sel=document.getElementById("chatProv"),cur=sel.value;\n' +
+    '    sel.innerHTML="";\n' +
+    '    Object.keys(providers).forEach(function(id){var o=document.createElement("option");o.value=id;o.textContent=providers[id].name+(providers[id].connected?" \\u2713":"");sel.appendChild(o)});\n' +
+    '    if(cur)sel.value=cur;\n' +
+    '  }catch(e){}\n' +
     '}\n' +
 
-    'function renderProviderCards(containerId, compact) {\n' +
-    '  var grid = document.getElementById(containerId);\n' +
-    '  if(!grid) return;\n' +
-    '  grid.innerHTML = "";\n' +
+    'function renderCards(cid,compact){\n' +
+    '  var g=document.getElementById(cid);if(!g)return;\n' +
+    '  g.innerHTML="";\n' +
     '  Object.keys(providers).forEach(function(id){\n' +
-    '    var p = providers[id];\n' +
-    '    var card = document.createElement("div");\n' +
-    '    card.className = "p-card";\n' +
-    '    var isReady = p.configured;\n' +
-    '    var isConnected = p.connected;\n' +
-    '    var statusClass = isConnected ? "connected" : (isReady ? "ready" : "not-configured");\n' +
-    '    var statusText = isConnected ? "Connected \\u2022 up " + fmtUptime(p.uptime) : (isReady ? "Ready to connect" : "API key not set");\n' +
-    '    card.innerHTML = \'<div class="p-card-head">\' +\n' +
-    '      \'<div class="p-card-icon" style="background:\'+p.color+\'">\'+p.icon+\'</div>\' +\n' +
-    '      \'<div><div class="p-card-name">\'+p.name+\'</div><div class="p-card-desc">\'+p.desc+\'</div><div class="p-card-model">\'+p.model+\'</div></div>\' +\n' +
-    '      \'</div>\' +\n' +
-    '      \'<div class="p-card-status \'+statusClass+\'">\' +\n' +
-    '        \'<span class="status-dot \'+(isConnected?"on":"off")+\'"></span>\' + statusText +\n' +
-    '      \'</div>\' +\n' +
-    '      (compact ? \'\' : \'<div class="p-card-meta">\'+p.requests+\' requests served</div>\' +\n' +
-    '        \'<div class="p-card-actions">\' +\n' +
-    '          (isReady ? \'<button class="btn btn-primary btn-sm" onclick="initProvider(\\\'\'+id+\'\\\')">\'+(isConnected?"Test":"Connect")+\'</button>\' : \'<button class="btn btn-outline btn-sm" onclick="switchPage(\\\'setup\\\')">Setup</button>\') +\n' +
-    '          (isConnected ? \'<button class="btn btn-outline btn-sm" onclick="switchPage(\\\'playground\\\')">Chat</button>\' : \'\') +\n' +
-    '        \'</div>\');\n' +
-    '    grid.appendChild(card);\n' +
+    '    var p=providers[id],c=document.createElement("div");\n' +
+    '    c.className="p-card";\n' +
+    '    var isC=p.connected;\n' +
+    '    var sClass=isC?"connected":"disconnected";\n' +
+    '    var sText=isC?"Connected \\u2022 up "+fmtUptime(p.uptime):"Disconnected";\n' +
+    '    c.innerHTML=\'<div class="p-card-head"><div class="p-card-icon" style="background:\'+p.color+\'">\'+p.icon+\'</div><div><div class="p-card-name">\'+p.name+\'</div><div class="p-card-desc">\'+p.desc+\'</div></div></div>\'+\n' +
+    '      \'<div class="p-card-status \'+sClass+\'"><span class="status-dot \'+(isC?"on":"off")+\'"></span>\'+sText+\'</div>\'+\n' +
+    '      (compact?\'\':\'<div class="p-card-meta">\'+p.requests+\' requests</div><div class="p-card-actions">\'+\n' +
+    '        (isC?\'<button class="btn btn-outline btn-sm" onclick="initProv(\\\'\'+id+\'\\\')">Reconnect</button><button class="btn btn-outline btn-sm" onclick="switchPage(\\\'playground\\\')">Chat</button>\':\'<button class="btn btn-primary btn-sm" onclick="initProv(\\\'\'+id+\'\\\')">Connect</button>\')+\'</div>\');\n' +
+    '    g.appendChild(c);\n' +
     '  });\n' +
-    '  var lbl = document.getElementById("providerCountLabel");\n' +
-    '  if(lbl) lbl.textContent = Object.keys(providers).length + " providers";\n' +
-    '}\n' +
-
-    'function renderSetupStatus() {\n' +
-    '  var alert = document.getElementById("setupAlert");\n' +
-    '  var missing = [];\n' +
-    '  Object.keys(providers).forEach(function(id){if(!providers[id].configured) missing.push(providers[id].name)});\n' +
-    '  if(missing.length > 0) {\n' +
-    '    alert.innerHTML = \'<div class="alert"><span class="alert-icon">\\u26a0\\ufe0f</span><div class="alert-text"><strong>Setup Required:</strong> \'+missing.join(", ")+\' need API keys. <a href="#" onclick="switchPage(\\\'setup\\\');return false" style="color:var(--blue)">Setup Guide</a></div></div>\';\n' +
-    '  } else {\n' +
-    '    alert.innerHTML = "";\n' +
-    '  }\n' +
-    '  // Setup page status\n' +
-    '  var gs = document.getElementById("geminiStatus");\n' +
-    '  if(gs) gs.innerHTML = providers.gemini && providers.gemini.configured ? \'<span style="color:var(--green)">\\u2713 GEMINI_API_KEY is set</span>\' : \'<span style="color:var(--red)">\\u2717 GEMINI_API_KEY not set</span>\';\n' +
-    '  var grs = document.getElementById("groqStatus");\n' +
-    '  if(grs) grs.innerHTML = providers.llama && providers.llama.configured ? \'<span style="color:var(--green)">\\u2713 GROQ_API_KEY is set</span>\' : \'<span style="color:var(--red)">\\u2717 GROQ_API_KEY not set</span>\';\n' +
+    '  var l=document.getElementById("provCountLabel");if(l)l.textContent=Object.keys(providers).length+" providers";\n' +
     '}\n' +
 
     // INIT PROVIDER
-    'async function initProvider(id) {\n' +
-    '  showToast("Testing "+id+"...", "var(--amber)");\n' +
-    '  try {\n' +
-    '    var res = await fetch("/v1/providers/"+id+"/init", {method:"POST"});\n' +
-    '    var data = await res.json();\n' +
-    '    if(data.error) showToast("Error: "+data.error, "var(--red)");\n' +
-    '    else showToast(id+" connected! Response: "+data.test);\n' +
-    '  } catch(e) { showToast("Failed: "+e.message, "var(--red)"); }\n' +
-    '  loadProviders();\n' +
+    'async function initProv(id){\n' +
+    '  showToast("Connecting to "+id+"... this may take 15-30s","var(--amber)");\n' +
+    '  try{\n' +
+    '    var res=await fetch("/v1/providers/"+id+"/init",{method:"POST"});\n' +
+    '    var d=await res.json();\n' +
+    '    if(d.error)showToast("Error: "+d.error,"var(--red)");\n' +
+    '    else showToast(id+" connected!");\n' +
+    '  }catch(e){showToast("Failed: "+e.message,"var(--red)")}\n' +
+    '  loadProviders();loadStats();\n' +
     '}\n' +
 
-    // LOAD STATS
-    'async function loadStats() {\n' +
-    '  try {\n' +
-    '    var res = await fetch("/v1/stats");\n' +
-    '    var s = await res.json();\n' +
-    '    document.getElementById("statsRow").innerHTML =\n' +
-    '      \'<div class="stat-card"><div class="label">Total Requests</div><div class="value">\'+s.totalCalls+\'</div><div class="sub">All time</div></div>\' +\n' +
-    '      \'<div class="stat-card"><div class="label">Active Keys</div><div class="value">\'+s.activeKeys+\'</div><div class="sub">\'+s.totalKeys+\' total generated</div></div>\' +\n' +
-    '      \'<div class="stat-card"><div class="label">Ready Providers</div><div class="value">\'+s.readyProviders+\'</div><div class="sub">of \'+s.totalProviders+\' available</div></div>\' +\n' +
+    // STATS
+    'async function loadStats(){\n' +
+    '  try{\n' +
+    '    var res=await fetch("/v1/stats");\n' +
+    '    var s=await res.json();\n' +
+    '    document.getElementById("statsRow").innerHTML=\n' +
+    '      \'<div class="stat-card"><div class="label">Total Requests</div><div class="value">\'+s.totalCalls+\'</div><div class="sub">All time</div></div>\'+\n' +
+    '      \'<div class="stat-card"><div class="label">Active Keys</div><div class="value">\'+s.activeKeys+\'</div><div class="sub">\'+s.totalKeys+\' total</div></div>\'+\n' +
+    '      \'<div class="stat-card"><div class="label">Connected</div><div class="value">\'+s.connectedProviders+\'</div><div class="sub">of 4 providers</div></div>\'+\n' +
     '      \'<div class="stat-card"><div class="label">Uptime</div><div class="value">\'+fmtUptime(s.uptime)+\'</div><div class="sub">\'+s.errors+\' errors</div></div>\';\n' +
-    '  } catch(e) { console.error(e); }\n' +
+    '  }catch(e){}\n' +
     '}\n' +
 
     // KEYS
-    'async function generateKey() {\n' +
-    '  var res = await fetch("/v1/keys", {method:"POST"});\n' +
-    '  var data = await res.json();\n' +
-    '  myKey = data.key;\n' +
-    '  localStorage.setItem("nova_key", myKey);\n' +
-    '  showToast("Key generated — save it now!");\n' +
-    '  loadKeys();\n' +
-    '}\n' +
+    'async function generateKey(){var r=await fetch("/v1/keys",{method:"POST"});var d=await r.json();myKey=d.key;localStorage.setItem("nova_key",myKey);showToast("Key generated!");loadKeys()}\n' +
 
-    'async function loadKeys() {\n' +
-    '  try {\n' +
-    '    var res = await fetch("/v1/keys");\n' +
-    '    keys = await res.json();\n' +
-    '    var tbody = document.getElementById("keysTableBody");\n' +
-    '    if(!keys.length) {\n' +
-    '      tbody.innerHTML = \'<tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet. Click "+ New Key" to generate one.</td></tr>\';\n' +
-    '      return;\n' +
-    '    }\n' +
-    '    tbody.innerHTML = "";\n' +
+    'async function loadKeys(){\n' +
+    '  try{\n' +
+    '    var res=await fetch("/v1/keys");\n' +
+    '    keys=await res.json();\n' +
+    '    var b=document.getElementById("keysBody");\n' +
+    '    if(!keys.length){b.innerHTML=\'<tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet.</td></tr>\';return}\n' +
+    '    b.innerHTML="";\n' +
     '    keys.forEach(function(k){\n' +
-    '      var tr = document.createElement("tr");\n' +
-    '      var provTags = k.providers.map(function(p){\n' +
-    '        var col = providers[p] ? providers[p].color : "#555";\n' +
-    '        return \'<span style="background:\'+col+\'22;color:\'+col+\';padding:2px 7px;border-radius:4px;font-size:10px;margin-right:4px">\'+p+\'</span>\';\n' +
-    '      }).join("") || \'<span style="color:#444">\\u2014</span>\';\n' +
-    '      tr.innerHTML =\n' +
-    '        \'<td><span class="mono">\'+k.key+\'</span> <button class="copy-btn" onclick="copyText(\\\'\'+k.full+\'\\\', this)">\\ud83d\\udccb</button></td>\' +\n' +
-    '        \'<td>\'+fmtDate(new Date(k.created).getTime())+\'</td>\' +\n' +
-    '        \'<td style="font-weight:600">\'+k.calls+\'</td>\' +\n' +
-    '        \'<td>\'+provTags+\'</td>\' +\n' +
-    '        \'<td>\'+(k.revoked?\'<span style="color:var(--red)">Revoked</span>\':\'<span style="color:var(--green)">Active</span>\')+\'</td>\' +\n' +
+    '      var tr=document.createElement("tr");\n' +
+    '      var tags=k.providers.map(function(p){var col=providers[p]?providers[p].color:"#555";return \'<span style="background:\'+col+\'22;color:\'+col+\';padding:2px 7px;border-radius:4px;font-size:10px;margin-right:4px">\'+p+\'</span>\'}).join("")||\'<span style="color:#444">\\u2014</span>\';\n' +
+    '      tr.innerHTML=\'<td><span class="mono">\'+k.key+\'</span> <button class="copy-btn" onclick="copyText(\\\'\'+k.full+\'\\\',this)">\\ud83d\\udccb</button></td>\'+\n' +
+    '        \'<td>\'+fmtDate(new Date(k.created).getTime())+\'</td>\'+\n' +
+    '        \'<td style="font-weight:600">\'+k.calls+\'</td>\'+\n' +
+    '        \'<td>\'+tags+\'</td>\'+\n' +
+    '        \'<td>\'+(k.revoked?\'<span style="color:var(--red)">Revoked</span>\':\'<span style="color:var(--green)">Active</span>\')+\'</td>\'+\n' +
     '        \'<td>\'+(k.revoked?\'\\u2014\':\'<button class="btn btn-danger btn-xs" onclick="revokeKey(\\\'\'+k.full+\'\\\')">Revoke</button>\')+\'</td>\';\n' +
-    '      tbody.appendChild(tr);\n' +
+    '      b.appendChild(tr);\n' +
     '    });\n' +
-    '  } catch(e) { console.error(e); }\n' +
+    '  }catch(e){}\n' +
     '}\n' +
 
-    'async function revokeKey(key) {\n' +
-    '  if(!confirm("Revoke this key?")) return;\n' +
-    '  await fetch("/v1/keys/"+key, {method:"DELETE"});\n' +
-    '  showToast("Key revoked");\n' +
-    '  loadKeys(); loadStats();\n' +
-    '}\n' +
+    'async function revokeKey(k){if(!confirm("Revoke this key?"))return;await fetch("/v1/keys/"+k,{method:"DELETE"});showToast("Revoked");loadKeys();loadStats()}\n' +
 
     // PLAYGROUND
-    'var chatBox, chatInput, sendBtn;\n' +
-    'document.addEventListener("DOMContentLoaded", function(){\n' +
-    '  chatBox = document.getElementById("chatBox");\n' +
-    '  chatInput = document.getElementById("chatInput");\n' +
-    '  sendBtn = document.getElementById("sendBtn");\n' +
-    '  chatInput.addEventListener("keydown", function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMsg()}});\n' +
-    '  chatInput.addEventListener("input", function(){chatInput.style.height="auto";chatInput.style.height=Math.min(chatInput.scrollHeight,120)+"px"});\n' +
+    'var chatBox,chatInput,sendBtn;\n' +
+    'document.addEventListener("DOMContentLoaded",function(){\n' +
+    '  chatBox=document.getElementById("chatBox");\n' +
+    '  chatInput=document.getElementById("chatInput");\n' +
+    '  sendBtn=document.getElementById("sendBtn");\n' +
+    '  chatInput.addEventListener("keydown",function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMsg()}});\n' +
+    '  chatInput.addEventListener("input",function(){chatInput.style.height="auto";chatInput.style.height=Math.min(chatInput.scrollHeight,120)+"px"});\n' +
     '});\n' +
 
-    'function addMsg(text, cls, meta) {\n' +
-    '  var div = document.createElement("div");\n' +
-    '  div.className = "msg "+cls;\n' +
-    '  if(cls==="msg-bot"||cls==="msg-user") {\n' +
-    '    var safe = text.replace(/</g,"&lt;").replace(/>/g,"&gt;");\n' +
-    '    div.innerHTML = safe + \'<button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.replace(/\\\\ud83d\\\\udccb/g,\'\').trim(),this)">\\ud83d\\udccb</button>\' + (meta?\'<div class="msg-meta">\'+meta+\'</div>\':\'\');\n' +
-    '  } else {\n' +
-    '    div.textContent = text;\n' +
-    '  }\n' +
-    '  chatBox.appendChild(div);\n' +
-    '  chatBox.scrollTop = chatBox.scrollHeight;\n' +
-    '  return div;\n' +
+    'function addMsg(text,cls,meta){\n' +
+    '  var d=document.createElement("div");d.className="msg "+cls;\n' +
+    '  if(cls==="msg-bot"||cls==="msg-user"){\n' +
+    '    d.innerHTML=text.replace(/</g,"&lt;").replace(/>/g,"&gt;")+\' <button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\'+(meta?\'<div class="msg-meta">\'+meta+\'</div>\':\'\');\n' +
+    '  }else{d.textContent=text}\n' +
+    '  chatBox.appendChild(d);chatBox.scrollTop=chatBox.scrollHeight;return d;\n' +
     '}\n' +
 
-    'async function sendMsg() {\n' +
+    'async function sendMsg(){\n' +
     '  if(!myKey){showToast("Generate an API key first","var(--red)");switchPage("keys");return}\n' +
-    '  var text = chatInput.value.trim();\n' +
-    '  if(!text) return;\n' +
-    '  var provider = document.getElementById("chatProvider").value;\n' +
-    '  addMsg(text, "msg-user");\n' +
-    '  chatInput.value=""; chatInput.style.height="44px";\n' +
+    '  var text=chatInput.value.trim();if(!text)return;\n' +
+    '  var prov=document.getElementById("chatProv").value;\n' +
+    '  addMsg(text,"msg-user");chatInput.value="";chatInput.style.height="44px";\n' +
     '  sendBtn.disabled=true;\n' +
-    '  var thinking = addMsg("", "msg-bot");\n' +
-    '  thinking.innerHTML = \'<span class="spinner"></span> Querying \'+provider+\'...\';\n' +
-    '  try {\n' +
-    '    var res = await fetch("/v1/chat/"+provider, {\n' +
-    '      method:"POST",\n' +
-    '      headers:{"Content-Type":"application/json","Authorization":"Bearer "+myKey},\n' +
-    '      body:JSON.stringify({message:text})\n' +
-    '    });\n' +
-    '    var data = await res.json();\n' +
-    '    if(data.error) {\n' +
-    '      thinking.className = "msg msg-error";\n' +
-    '      thinking.innerHTML = "Error: "+data.error.replace(/</g,"&lt;")+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\';\n' +
-    '    } else {\n' +
-    '      thinking.className = "msg msg-bot";\n' +
-    '      var safe = data.reply.replace(/</g,"&lt;").replace(/>/g,"&gt;");\n' +
-    '      thinking.innerHTML = safe + \'<button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button><div class="msg-meta">\'+data.model+" \\u00b7 "+data.latency+\'</div>\';\n' +
+    '  var think=addMsg("","msg-bot");\n' +
+    '  think.innerHTML=\'<span class="spinner"></span> Querying \'+prov+\'...\';\n' +
+    '  try{\n' +
+    '    var res=await fetch("/v1/chat/"+prov,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+myKey},body:JSON.stringify({message:text})});\n' +
+    '    var d=await res.json();\n' +
+    '    if(d.error){\n' +
+    '      think.className="msg msg-error";\n' +
+    '      think.innerHTML="Error: "+d.error.replace(/</g,"&lt;")+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\';\n' +
+    '    }else{\n' +
+    '      think.className="msg msg-bot";\n' +
+    '      think.innerHTML=d.reply.replace(/</g,"&lt;").replace(/>/g,"&gt;")+\' <button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button><div class="msg-meta">\'+d.model+" \\u00b7 "+d.latency+\'</div>\';\n' +
     '    }\n' +
-    '  } catch(e) {\n' +
-    '    thinking.className = "msg msg-error";\n' +
-    '    thinking.innerHTML = "Network error: "+e.message+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\';\n' +
-    '  }\n' +
-    '  sendBtn.disabled=false;\n' +
-    '  chatInput.focus();\n' +
-    '  loadStats();\n' +
+    '  }catch(e){think.className="msg msg-error";think.innerHTML="Network error: "+e.message+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\'}\n' +
+    '  sendBtn.disabled=false;chatInput.focus();loadStats();\n' +
     '}\n' +
 
-    'async function newChat() {\n' +
-    '  var provider = document.getElementById("chatProvider").value;\n' +
-    '  await fetch("/v1/providers/"+provider+"/newchat", {\n' +
-    '    method:"POST",\n' +
-    '    headers:{"Authorization":"Bearer "+myKey}\n' +
-    '  });\n' +
-    '  clearChat();\n' +
-    '  addMsg("New conversation started on "+provider, "msg-system");\n' +
-    '}\n' +
+    'async function newChat(){var p=document.getElementById("chatProv").value;await fetch("/v1/providers/"+p+"/newchat",{method:"POST"});clearChat();addMsg("New chat on "+p,"msg-system")}\n' +
+    'function clearChat(){chatBox.innerHTML=""}\n' +
 
-    'function clearChat() { chatBox.innerHTML=""; }\n' +
-
-    // INIT
-    'loadProviders();\n' +
-    'loadStats();\n' +
-    'loadKeys();\n' +
-    'setInterval(function(){loadProviders();loadStats()},15000);\n' +
+    'loadProviders();loadStats();loadKeys();setInterval(function(){loadProviders();loadStats()},15000);\n' +
     '</script>\n</body>\n</html>';
 }
 
-// ═══════════════════════════════════════════════════
+// ═══════════════════════════════════════
 // START
-// ═══════════════════════════════════════════════════
-var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() {
+// ═══════════════════════════════════════
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
     console.log('');
-    console.log('  Nova API Gateway v2.0');
+    console.log('  Nova API Gateway v2.0 (Playwright + Firefox)');
     console.log('  http://localhost:' + PORT);
-    console.log('');
-    Object.keys(PROVIDERS).forEach(function(id) {
-        var p = PROVIDERS[id];
-        var status = process.env[p.envKey] ? '✓ ready' : '✗ missing ' + p.envKey;
-        console.log('  ' + p.name + ': ' + status);
-    });
+    console.log('  Providers: ' + Object.keys(PROVIDERS).join(', '));
     console.log('');
 });
