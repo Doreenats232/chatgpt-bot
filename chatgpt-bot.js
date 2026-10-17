@@ -1,6 +1,6 @@
 // ============================================
-//  NOVA API GATEWAY v3
-//  Universal AI Gateway with Browser View
+//  NOVA API GATEWAY v3.1
+//  Memory-safe browser automation
 // ============================================
 
 const express = require('express');
@@ -16,7 +16,6 @@ const PORT = process.env.PORT || 3000;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// ====== PROVIDERS ======
 const PROVIDERS = {
   chatgpt:    { name: 'ChatGPT',    company: 'OpenAI GPT-4o',       color: '#10a37f', icon: 'G',  url: 'https://chatgpt.com' },
   claude:     { name: 'Claude',     company: 'Anthropic Claude 3.5', color: '#d97706', icon: 'C',  url: 'https://claude.ai/new' },
@@ -24,119 +23,149 @@ const PROVIDERS = {
   perplexity: { name: 'Perplexity', company: 'Perplexity AI',        color: '#20b2aa', icon: 'P',  url: 'https://www.perplexity.ai' }
 };
 
-// ====== STATE ======
 let browser = null;
-const pages = {};
+let activeProvider = null; // only ONE at a time
+const providers = {};
 const apiKeys = {};
-const stats = { totalRequests: 0, providers: {} };
+const stats = { totalRequests: 0 };
 Object.keys(PROVIDERS).forEach(id => {
-  stats.providers[id] = { requests: 0, lastUsed: null, status: 'disconnected' };
+  providers[id] = { status: 'disconnected', requests: 0, lastUsed: null, error: null };
 });
 
 // ====== SESSIONS ======
 function loadSession(id) {
-  try {
-    const f = path.join(SESSIONS_DIR, id + '.json');
-    return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
-  } catch (e) { return null; }
+  try { const f = path.join(SESSIONS_DIR, id + '.json'); return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null; } catch (e) { return null; }
 }
 function saveSession(id, state) {
   try { fs.writeFileSync(path.join(SESSIONS_DIR, id + '.json'), JSON.stringify(state)); } catch (e) {}
 }
 
-// ====== BROWSER ======
+// ====== BROWSER (one at a time) ======
 async function getBrowser() {
   if (browser && browser.isConnected()) return browser;
-  console.log('Launching Firefox...');
-  browser = await firefox.launch({ headless: true, args: ['--no-sandbox'] });
+  console.log('[Browser] Launching Firefox...');
+  browser = await firefox.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage']
+  });
   browser.on('disconnected', () => {
     browser = null;
-    Object.keys(pages).forEach(id => { pages[id] = null; });
-    console.log('Browser disconnected');
+    if (activeProvider) { providers[activeProvider].status = 'disconnected'; activeProvider = null; }
+    console.log('[Browser] Disconnected');
   });
-  console.log('Firefox launched');
+  console.log('[Browser] Firefox launched');
   return browser;
 }
 
+async function closeActiveProvider() {
+  if (activeProvider && providers[activeProvider]) {
+    try { await providers[activeProvider].context.close(); } catch (e) {}
+    providers[activeProvider] = { ...providers[activeProvider], status: 'disconnected', context: null, page: null };
+    activeProvider = null;
+  }
+  if (browser) { try { await browser.close(); } catch (e) {} browser = null; }
+}
+
 async function initProvider(id) {
-  const config = PROVIDERS[id];
-  if (!config) throw new Error('Unknown provider');
-  if (pages[id]) { try { await pages[id].context.close(); } catch (e) {} }
-  const b = await getBrowser();
-  const saved = loadSession(id);
-  const ctx = await b.newContext({
-    viewport: { width: 1280, height: 800 },
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    ...(saved ? { storageState: saved } : {})
-  });
-  const page = await ctx.newPage();
-  try { await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (e) {}
-  await page.waitForTimeout(3000);
-  pages[id] = { page, context: ctx, loggedIn: false };
-  const state = await detectState(id);
-  pages[id].loggedIn = state.state === 'connected';
-  if (pages[id].loggedIn) { saveSession(id, await ctx.storageState()); stats.providers[id].status = 'connected'; }
-  return { ...state, screenshot: await getScreenshot(id) };
+  if (!PROVIDERS[id]) throw new Error('Unknown provider');
+
+  // Close any existing provider to free memory
+  if (activeProvider && activeProvider !== id) {
+    providers[activeProvider].status = 'disconnected';
+    if (providers[activeProvider].context) try { await providers[activeProvider].context.close(); } catch (e) {}
+    providers[activeProvider].context = null;
+    providers[activeProvider].page = null;
+    if (browser) try { await browser.close(); } catch (e) {} browser = null;
+  }
+
+  providers[id].status = 'connecting';
+  providers[id].error = null;
+
+  try {
+    const b = await getBrowser();
+    const saved = loadSession(id);
+    const ctx = await b.newContext({
+      viewport: { width: 1024, height: 700 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+      ...(saved ? { storageState: saved } : {})
+    });
+    const page = await ctx.newPage();
+    await page.goto(PROVIDERS[id].url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000);
+
+    providers[id] = { ...providers[id], context: ctx, page, status: 'viewing' };
+    activeProvider = id;
+
+    const state = await detectState(id);
+    if (state.state === 'connected') {
+      providers[id].status = 'connected';
+      saveSession(id, await ctx.storageState());
+    }
+
+    return { ...state, screenshot: await getScreenshot(id) };
+  } catch (e) {
+    providers[id].status = 'disconnected';
+    providers[id].error = e.message;
+    throw e;
+  }
 }
 
 async function detectState(id) {
-  const p = pages[id];
-  if (!p) return { state: 'disconnected', message: 'Not connected' };
+  const p = providers[id];
+  if (!p || !p.page) return { state: 'disconnected', message: 'Not connected' };
   const page = p.page;
-  const url = page.url();
   try {
     const hasEmail = await page.$('input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]');
     const hasPass = await page.$('input[type="password"]');
-    const hasCode = await page.$('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+    const hasCode = await page.$('input[name="code"], input[autocomplete="one-time-code"]');
     const hasChat = await page.$('textarea:not([aria-hidden="true"]), [contenteditable="true"][role="textbox"], #prompt-textarea');
-    if (hasCode) return { state: 'needs_code', message: 'A verification code was sent to your email. Enter it below.' };
-    if (hasPass && !hasChat) return { state: 'needs_password', message: 'Enter your password below.' };
-    if (hasEmail && !hasChat) return { state: 'needs_email', message: 'Enter your email below to log in.' };
-    if (hasChat) return { state: 'connected', message: 'Logged in! Ready to chat.' };
-    if (url.includes('login') || url.includes('auth') || url.includes('signin'))
-      return { state: 'login', message: 'Login page detected. Click on the fields in the browser view or use the input below.' };
+
+    if (hasCode) return { state: 'needs_code', message: 'Verification code required — enter it below' };
+    if (hasPass && !hasChat) return { state: 'needs_password', message: 'Password required — enter it below' };
+    if (hasEmail && !hasChat) return { state: 'needs_email', message: 'Email required — enter it below' };
+    if (hasChat) {
+      providers[id].status = 'connected';
+      saveSession(id, await p.context.storageState());
+      return { state: 'connected', message: 'Logged in! Ready to chat.' };
+    }
   } catch (e) {}
-  return { state: 'viewing', message: 'Page loaded. Interact with the browser view below.' };
+  return { state: 'viewing', message: 'Page loaded — use the browser view to interact' };
 }
 
 async function getScreenshot(id) {
-  const p = pages[id];
-  if (!p) return null;
-  try { return (await p.page.screenshot({ type: 'jpeg', quality: 45 })).toString('base64'); } catch (e) { return null; }
+  const p = providers[id];
+  if (!p || !p.page) return null;
+  try { return (await p.page.screenshot({ type: 'jpeg', quality: 40 })).toString('base64'); } catch (e) { return null; }
 }
 
 async function clickAt(id, x, y) {
-  const p = pages[id]; if (!p) throw new Error('Not connected');
+  const p = providers[id]; if (!p || !p.page) throw new Error('Not connected');
   await p.page.mouse.click(x, y);
-  await p.page.waitForTimeout(1000);
+  await p.page.waitForTimeout(1500);
   const state = await detectState(id);
-  p.loggedIn = state.state === 'connected';
-  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
   return { ...state, screenshot: await getScreenshot(id) };
 }
 
 async function typeText(id, text) {
-  const p = pages[id]; if (!p) throw new Error('Not connected');
-  await p.page.keyboard.type(text, { delay: 25 });
+  const p = providers[id]; if (!p || !p.page) throw new Error('Not connected');
+  await p.page.keyboard.type(text, { delay: 20 });
   return { screenshot: await getScreenshot(id) };
 }
 
 async function pressKey(id, key) {
-  const p = pages[id]; if (!p) throw new Error('Not connected');
+  const p = providers[id]; if (!p || !p.page) throw new Error('Not connected');
   await p.page.keyboard.press(key);
-  await p.page.waitForTimeout(1500);
+  await p.page.waitForTimeout(2000);
   const state = await detectState(id);
-  p.loggedIn = state.state === 'connected';
-  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
   return { ...state, screenshot: await getScreenshot(id) };
 }
 
-async function fillLogin(id, fieldType, value) {
-  const p = pages[id]; if (!p) throw new Error('Not connected');
+async function fillField(id, fieldType, value) {
+  const p = providers[id]; if (!p || !p.page) throw new Error('Not connected');
   const page = p.page;
-  const sel = fieldType === 'email' ? 'input[type="email"], input[name="email"], input[name="username"]'
+  const sel = fieldType === 'email' ? 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]'
     : fieldType === 'password' ? 'input[type="password"]'
-    : 'input[name="code"], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="tel"]';
+    : 'input[name="code"], input[autocomplete="one-time-code"], input[type="tel"]';
   const input = await page.waitForSelector(sel, { timeout: 8000 });
   await input.click();
   await input.fill(value);
@@ -144,37 +173,29 @@ async function fillLogin(id, fieldType, value) {
   await page.keyboard.press('Enter');
   await page.waitForTimeout(4000);
   const state = await detectState(id);
-  p.loggedIn = state.state === 'connected';
-  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
   return { ...state, screenshot: await getScreenshot(id) };
 }
 
 async function sendChatMessage(id, message) {
-  const p = pages[id]; if (!p) throw new Error('Not connected');
-  if (!p.loggedIn) throw new Error('Not logged in — connect and log in first.');
+  const p = providers[id]; if (!p || !p.page) throw new Error('Not connected');
+  if (p.status !== 'connected') throw new Error('Not logged in yet');
   const page = p.page;
 
-  // Navigate to new chat if possible
   try {
-    const newChat = await page.$('a[href="/"], a[href="/new"], a[href="/app"], nav a:first-child');
+    const newChat = await page.$('a[href="/"], a[href="/new"]');
     if (newChat) { await newChat.click(); await page.waitForTimeout(2000); }
   } catch (e) {}
 
-  // Find and focus input
   const input = await page.locator('textarea, [contenteditable="true"][role="textbox"], #prompt-textarea').first();
   await input.click();
   await page.waitForTimeout(300);
-
-  // Type message
   try { await input.fill(message); } catch (e) { await page.keyboard.type(message, { delay: 15 }); }
   await page.waitForTimeout(500);
 
-  // Count existing responses
   const before = await page.evaluate(() =>
     document.querySelectorAll('[data-message-author-role="assistant"], .font-claude-message, .response-content, .prose').length
   );
 
-  // Send
   try { await page.keyboard.press('Enter'); } catch (e) {}
   const deadline = Date.now() + 90000;
   let response = '';
@@ -186,14 +207,12 @@ async function sendChatMessage(id, message) {
       return Array.from(els).map(e => e.innerText);
     });
     if (texts.length > before && texts[texts.length - 1].length > 10) {
-      let last = texts[texts.length - 1];
-      let stable = 0;
+      let last = texts[texts.length - 1], stable = 0;
       while (stable < 2 && Date.now() < deadline) {
         await page.waitForTimeout(2000);
         const cur = await page.evaluate(() => {
           const els = document.querySelectorAll('[data-message-author-role="assistant"], .font-claude-message, .response-content, .prose');
-          const a = Array.from(els);
-          return a.length > 0 ? a[a.length - 1].innerText : '';
+          return els.length > 0 ? els[els.length - 1].innerText : '';
         });
         if (cur === last) stable++; else { stable = 0; last = cur; }
       }
@@ -202,49 +221,69 @@ async function sendChatMessage(id, message) {
     }
   }
 
-  if (!response) response = 'No response received — the AI may still be processing or the page layout changed.';
+  if (!response) response = 'No response received.';
   stats.totalRequests++;
-  stats.providers[id].requests++;
-  stats.providers[id].lastUsed = new Date().toISOString();
+  providers[id].requests++;
+  providers[id].lastUsed = new Date().toISOString();
   try { saveSession(id, await p.context.storageState()); } catch (e) {}
   return response;
 }
 
-async function closeProvider(id) {
-  if (pages[id]) { try { await pages[id].context.close(); } catch (e) {} pages[id] = null; }
-  stats.providers[id].status = 'disconnected';
-}
-
 // ====== ROUTES ======
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
 app.get('/v1/providers', (req, res) => {
   res.json(Object.entries(PROVIDERS).map(([id, c]) => ({
     id, ...c,
-    status: pages[id]?.loggedIn ? 'connected' : pages[id] ? 'connecting' : 'disconnected',
-    requests: stats.providers[id]?.requests || 0
+    status: providers[id].status,
+    requests: providers[id].requests,
+    error: providers[id].error || null
   })));
 });
+
 app.post('/v1/providers/:id/init', async (req, res) => {
-  try { res.json(await initProvider(req.params.id)); } catch (e) { res.status(500).json({ error: e.message }); }
+  const id = req.params.id;
+  if (!PROVIDERS[id]) return res.status(404).json({ error: 'Unknown provider' });
+  try {
+    const result = await initProvider(id);
+    res.json(result);
+  } catch (e) {
+    console.error('[Init Error]', id, e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
+
 app.delete('/v1/providers/:id', async (req, res) => {
-  try { await closeProvider(req.params.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    if (activeProvider === req.params.id) await closeActiveProvider();
+    else if (providers[req.params.id]) { providers[req.params.id].status = 'disconnected'; }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.get('/v1/providers/:id/screenshot', async (req, res) => {
-  try { const s = await getScreenshot(req.params.id); s ? res.json({ screenshot: s }) : res.status(404).json({ error: 'No screenshot' }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const s = await getScreenshot(req.params.id);
+    s ? res.json({ screenshot: s }) : res.status(404).json({ error: 'No screenshot' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/v1/providers/:id/click', async (req, res) => {
   try { res.json(await clickAt(req.params.id, req.body.x, req.body.y)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/v1/providers/:id/type', async (req, res) => {
   try { res.json(await typeText(req.params.id, req.body.text)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/v1/providers/:id/key', async (req, res) => {
   try { res.json(await pressKey(req.params.id, req.body.key)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/v1/providers/:id/login', async (req, res) => {
-  try { res.json(await fillLogin(req.params.id, req.body.fieldType, req.body.value)); } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await fillField(req.params.id, req.body.fieldType, req.body.value)); } catch (e) { res.status(500).json({ error: e.message }); }
 });
+
 app.post('/v1/chat/:provider', async (req, res) => {
   try {
     const response = await sendChatMessage(req.params.provider, req.body.message);
@@ -252,7 +291,10 @@ app.post('/v1/chat/:provider', async (req, res) => {
       model: PROVIDERS[req.params.provider]?.name, choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.get('/v1/keys', (req, res) => { res.json(Object.entries(apiKeys).map(([k, d]) => ({ key: k.slice(0, 8) + '...' + k.slice(-4), fullKey: k, ...d }))); });
+
+app.get('/v1/keys', (req, res) => {
+  res.json(Object.entries(apiKeys).map(([k, d]) => ({ key: k.slice(0, 8) + '...' + k.slice(-4), fullKey: k, ...d })));
+});
 app.post('/v1/keys', (req, res) => {
   const key = 'nva-' + crypto.randomBytes(24).toString('hex');
   apiKeys[key] = { name: req.body.name || 'Unnamed', created: new Date().toISOString(), requests: 0 };
@@ -262,7 +304,7 @@ app.delete('/v1/keys/:key', (req, res) => {
   if (apiKeys[req.params.key]) { delete apiKeys[req.params.key]; res.json({ ok: true }); } else res.status(404).json({ error: 'Not found' });
 });
 app.get('/v1/stats', (req, res) => { res.json(stats); });
-app.get('/health', (req, res) => { res.json({ status: 'ok', uptime: process.uptime() }); });
+app.get('/health', (req, res) => { res.json({ status: 'ok', memory: process.memoryUsage().rss, active: activeProvider }); });
 
 // ====== FRONTEND ======
 app.get('/', (req, res) => { res.send(HTML); });
@@ -285,8 +327,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .nav-section{padding:16px 20px 6px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim)}
 .main{margin-left:220px;flex:1;padding:28px 32px;min-height:100vh}
 .page{display:none}.page.active{display:block}
-h1{font-size:24px;margin-bottom:20px}
-h2{font-size:18px;margin-bottom:16px;color:var(--dim)}
+h1{font-size:24px;margin-bottom:20px}h2{font-size:18px;margin-bottom:16px;color:var(--dim)}
 .stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:28px}
 .stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
 .stat-label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
@@ -296,18 +337,16 @@ h2{font-size:18px;margin-bottom:16px;color:var(--dim)}
 .provider-card:hover{border-color:var(--accent);transform:translateY(-2px)}
 .provider-header{display:flex;align-items:center;gap:12px;margin-bottom:14px}
 .provider-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff}
-.provider-name{font-size:16px;font-weight:600}
-.provider-company{font-size:12px;color:var(--dim)}
+.provider-name{font-size:16px;font-weight:600}.provider-company{font-size:12px;color:var(--dim)}
 .provider-status{display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:14px}
-.dot{width:8px;height:8px;border-radius:50%}
-.dot.green{background:var(--green)}.dot.yellow{background:var(--yellow)}.dot.gray{background:#555}
+.dot{width:8px;height:8px;border-radius:50%}.dot.green{background:var(--green)}.dot.yellow{background:var(--yellow)}.dot.gray{background:#555}.dot.red{background:var(--red)}
 .provider-reqs{font-size:12px;color:var(--dim);margin-bottom:14px}
+.provider-error{font-size:12px;color:var(--red);margin-bottom:10px;padding:8px;background:rgba(239,68,68,.08);border-radius:6px}
 .btn{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:.2s;display:inline-flex;align-items:center;gap:6px}
 .btn-primary{background:var(--grad);color:#fff}.btn-primary:hover{opacity:.85}
 .btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}.btn-danger:hover{background:rgba(239,68,68,.25)}
 .btn-secondary{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{background:rgba(255,255,255,.1)}
-.btn-sm{padding:6px 12px;font-size:12px}
-.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-sm{padding:6px 12px;font-size:12px}.btn:disabled{opacity:.4;cursor:not-allowed}
 .keys-table{width:100%;border-collapse:collapse;margin-top:16px}
 .keys-table th,.keys-table td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:13px}
 .keys-table th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
@@ -317,11 +356,9 @@ h2{font-size:18px;margin-bottom:16px;color:var(--dim)}
 select{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;cursor:pointer}
 select:focus{outline:none;border-color:var(--accent)}
 .chat-messages{flex:1;overflow-y:auto;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:12px}
-.msg{margin-bottom:12px;max-width:80%}
-.msg.user{margin-left:auto;text-align:right}
+.msg{margin-bottom:12px;max-width:80%}.msg.user{margin-left:auto;text-align:right}
 .msg .bubble{display:inline-block;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5}
-.msg.user .bubble{background:var(--accent);color:#fff}
-.msg.ai .bubble{background:rgba(255,255,255,.06);border:1px solid var(--border)}
+.msg.user .bubble{background:var(--accent);color:#fff}.msg.ai .bubble{background:rgba(255,255,255,.06);border:1px solid var(--border)}
 .msg .label{font-size:11px;color:var(--dim);margin-bottom:4px}
 .chat-input-row{display:flex;gap:8px}
 .chat-input-row input{flex:1;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:12px 16px;font-size:14px}
@@ -333,11 +370,13 @@ select:focus{outline:none;border-color:var(--accent)}
 .method{font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px;min-width:50px;text-align:center}
 .method.get{background:rgba(34,197,94,.15);color:var(--green)}.method.post{background:rgba(99,102,241,.15);color:var(--accent)}.method.delete{background:rgba(239,68,68,.15);color:var(--red)}
 .ep-path{font-family:monospace;font-size:13px}
-
-/* Browser View Modal */
-.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);z-index:1000;align-items:center;justify-content:center}
+.mem-bar{margin-top:12px;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--dim);display:flex;align-items:center;gap:10px}
+.mem-bar .bar{flex:1;height:6px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden}
+.mem-bar .bar-fill{height:100%;border-radius:3px;transition:.3s}
+.notice{padding:12px 16px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:10px;font-size:13px;color:var(--yellow);margin-bottom:20px}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center}
 .modal-overlay.show{display:flex}
-.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:95%;max-width:1000px;max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:95%;max-width:960px;max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
 .modal-top{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
 .modal-top h3{font-size:15px;font-weight:600}
 .close-btn{background:none;border:none;color:var(--dim);font-size:22px;cursor:pointer;padding:4px 8px}.close-btn:hover{color:var(--text)}
@@ -346,59 +385,52 @@ select:focus{outline:none;border-color:var(--accent)}
 .bv-screen .click-ring{position:absolute;width:20px;height:20px;border:2px solid var(--accent);border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;animation:ping .4s ease-out forwards}
 @keyframes ping{0%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(2)}}
 .bv-status{display:flex;align-items:center;gap:8px;padding:10px 20px;font-size:13px}
-.bv-status .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .bv-controls{display:flex;gap:8px;padding:0 20px 16px}
 .bv-controls input{flex:1;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:13px}
 .bv-controls input:focus{outline:none;border-color:var(--accent)}
 .bv-hint{padding:0 20px 14px;font-size:11px;color:var(--dim)}
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--dim);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.hidden{display:none!important}
+.loading-overlay{position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);display:flex;flex-direction:column;align-items:center;justify-content:center;border-radius:8px;z-index:5}
+.loading-overlay .spinner{width:28px;height:28px;margin-bottom:12px}
 </style>
 </head>
 <body>
 <div class="app">
 <nav class="sidebar">
 <div class="logo">Nova API</div>
-<div class="nav-item active" onclick="nav('overview')">Overview</div>
+<div class="nav-item active" onclick="nav('overview',this)">Overview</div>
 <div class="nav-section">Dashboard</div>
-<div class="nav-item" onclick="nav('providers')">Providers</div>
+<div class="nav-item" onclick="nav('providers',this)">Providers</div>
 <div class="nav-section">Management</div>
-<div class="nav-item" onclick="nav('keys')">API Keys</div>
+<div class="nav-item" onclick="nav('keys',this)">API Keys</div>
 <div class="nav-section">Tools</div>
-<div class="nav-item" onclick="nav('playground')">Playground</div>
-<div class="nav-item" onclick="nav('docs')">API Docs</div>
+<div class="nav-item" onclick="nav('playground',this)">Playground</div>
+<div class="nav-item" onclick="nav('docs',this)">API Docs</div>
 </nav>
 <div class="main">
-
-<!-- OVERVIEW -->
 <div class="page active" id="page-overview">
 <h1>Overview</h1>
+<div class="notice">One provider at a time on free tier (512MB RAM). Connect one, log in, then chat. Disconnect before switching.</div>
 <div class="stats-row">
-<div class="stat-card"><div class="stat-label">Connected</div><div class="stat-value" id="ov-connected">0</div></div>
+<div class="stat-card"><div class="stat-label">Active Provider</div><div class="stat-value" id="ov-active">None</div></div>
+<div class="stat-card"><div class="stat-label">Status</div><div class="stat-value" id="ov-status" style="font-size:18px">Disconnected</div></div>
 <div class="stat-card"><div class="stat-label">Total Requests</div><div class="stat-value" id="ov-requests">0</div></div>
 <div class="stat-card"><div class="stat-label">API Keys</div><div class="stat-value" id="ov-keys">0</div></div>
 </div>
-<h2>Providers</h2>
+<div class="mem-bar"><span>Memory</span><div class="bar"><div class="bar-fill" id="mem-fill" style="width:0%;background:var(--green)"></div></div><span id="mem-text">--</span></div>
+<h2 style="margin-top:20px">Providers</h2>
 <div class="providers-grid" id="ov-providers"></div>
 </div>
-
-<!-- PROVIDERS -->
 <div class="page" id="page-providers">
 <h1>Providers</h1>
+<div class="notice">Only one provider can be active at a time. Connecting a new one will disconnect the current provider.</div>
 <div class="providers-grid" id="pv-grid"></div>
 </div>
-
-<!-- KEYS -->
 <div class="page" id="page-keys">
-<div style="display:flex;align-items:center;justify-content:space-between">
-<h1>API Keys</h1>
-<button class="btn btn-primary" onclick="genKey()">+ Generate Key</button>
-</div>
+<div style="display:flex;align-items:center;justify-content:space-between"><h1>API Keys</h1><button class="btn btn-primary" onclick="genKey()">+ Generate Key</button></div>
 <table class="keys-table"><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Requests</th><th></th></tr></thead><tbody id="keys-body"></tbody></table>
 </div>
-
-<!-- PLAYGROUND -->
 <div class="page" id="page-playground">
 <h1>Playground</h1>
 <div class="playground-area">
@@ -413,8 +445,6 @@ select:focus{outline:none;border-color:var(--accent)}
 </div>
 </div>
 </div>
-
-<!-- DOCS -->
 <div class="page" id="page-docs">
 <h1>API Docs</h1>
 <div class="docs-content">
@@ -432,27 +462,21 @@ select:focus{outline:none;border-color:var(--accent)}
 <div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/keys</span></div>
 <div class="endpoint"><span class="method delete">DEL</span><span class="ep-path">/v1/keys/:key</span></div>
 <div class="endpoint"><span class="method get">GET</span><span class="ep-path">/v1/stats</span></div>
-<br>
-<h2>Usage</h2>
+<div class="endpoint"><span class="method get">GET</span><span class="ep-path">/health</span></div>
+<br><h2>Usage</h2>
 <pre>curl -X POST /v1/chat/chatgpt \\
   -H "Content-Type: application/json" \\
   -d '{"message": "Hello!"}'</pre>
-<p>Responses follow OpenAI-compatible format.</p>
 </div>
 </div>
-
 </div>
 </div>
-
-<!-- BROWSER VIEW MODAL -->
 <div class="modal-overlay" id="bv-modal">
 <div class="modal-box">
-<div class="modal-top">
-<h3 id="bv-title">Provider</h3>
-<button class="close-btn" onclick="closeBV()">&times;</button>
-</div>
+<div class="modal-top"><h3 id="bv-title">Provider</h3><button class="close-btn" onclick="closeBV()">&times;</button></div>
 <div class="bv-screen" id="bv-screen" onclick="bvClick(event)">
 <img id="bv-img" src="">
+<div class="loading-overlay" id="bv-loading"><div class="spinner"></div><span style="font-size:13px;color:var(--dim)">Launching browser...</span></div>
 </div>
 <div class="bv-status"><span class="dot gray" id="bv-dot"></span><span id="bv-msg">Loading...</span></div>
 <div class="bv-controls">
@@ -461,312 +485,153 @@ select:focus{outline:none;border-color:var(--accent)}
 <button class="btn btn-secondary btn-sm" onclick="bvSendKey('Enter')">Enter</button>
 <button class="btn btn-secondary btn-sm" onclick="bvSendKey('Tab')">Tab</button>
 </div>
-<div class="bv-hint">Click anywhere on the browser image to interact. Type in the field below to enter text. Use Enter/Tab buttons for special keys.</div>
+<div class="bv-hint">Click on the screenshot to interact. Type below to fill email/password fields. Use Enter/Tab for special keys.</div>
 </div>
 </div>
-
 <script>
-let bvProvider = null;
-let bvPolling = null;
-let providers = [];
-
-function nav(page) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.getElementById('page-' + page).classList.add('active');
-  event.target.classList.add('active');
-  if (page === 'providers' || page === 'overview') loadProviders();
-  if (page === 'keys') loadKeys();
-  if (page === 'playground') loadProviders();
-  if (page === 'overview') loadStats();
+let bvProvider=null,bvPolling=null,providers=[],connecting=false;
+function nav(page,el){document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));document.getElementById('page-'+page).classList.add('active');if(el)el.classList.add('active');else event.target.classList.add('active');loadAll();}
+async function loadAll(){try{const[r1,r2]=await Promise.all([fetch('/v1/providers'),fetch('/v1/stats')]);providers=await r1.json();const s=await r2.json();renderAll(providers,s);}catch(e){console.error(e);}}
+function renderAll(ps,s){
+  // Overview
+  const active=ps.find(p=>p.status==='connected'||p.status==='connecting'||p.status==='viewing');
+  document.getElementById('ov-active').textContent=active?active.name:'None';
+  const st=active?active.status:'disconnected';
+  document.getElementById('ov-status').textContent=st.charAt(0).toUpperCase()+st.slice(1);
+  document.getElementById('ov-status').style.color=st==='connected'?'var(--green)':st==='connecting'||st==='viewing'?'var(--yellow)':'var(--dim)';
+  document.getElementById('ov-requests').textContent=s.totalRequests;
+  renderGrid('ov-providers',ps);
+  renderGrid('pv-grid',ps);
+  // Playground
+  const sel=document.getElementById('pg-provider');const cur=sel.value;
+  sel.innerHTML='<option value="">Select provider...</option>'+ps.filter(p=>p.status==='connected').map(p=>'<option value="'+p.id+'">'+p.name+'</option>').join('');
+  if(cur)sel.value=cur;
+  // Memory
+  fetch('/health').then(r=>r.json()).then(h=>{
+    const mb=Math.round(h.memory/1024/1024);
+    const pct=Math.min(100,Math.round(mb/512*100));
+    document.getElementById('mem-fill').style.width=pct+'%';
+    document.getElementById('mem-fill').style.background=pct>80?'var(--red)':pct>60?'var(--yellow)':'var(--green)';
+    document.getElementById('mem-text').textContent=mb+'MB / 512MB';
+  }).catch(()=>{});
 }
-
-async function loadProviders() {
-  try {
-    const r = await fetch('/v1/providers');
-    providers = await r.json();
-    renderProviders();
-    updateOverview();
-    updatePgSelect();
-  } catch (e) { console.error(e); }
+function renderGrid(id,ps){
+  const c=document.getElementById(id);if(!c)return;
+  c.innerHTML=ps.map(p=>{
+    const dot=p.status==='connected'?'green':p.status==='connecting'||p.status==='viewing'?'yellow':'gray';
+    const st=p.status.charAt(0).toUpperCase()+p.status.slice(1);
+    let btns='';
+    if(p.status==='disconnected')btns='<button class="btn btn-primary btn-sm" onclick="connectP(\\''+p.id+'\\')">Connect</button>';
+    else if(p.status==='connecting')btns='<button class="btn btn-secondary btn-sm" onclick="openBV(\\''+p.id+'\\')">View Browser</button>';
+    else if(p.status==='viewing')btns='<button class="btn btn-secondary btn-sm" onclick="openBV(\\''+p.id+'\\')">View Browser</button>';
+    else btns='<button class="btn btn-secondary btn-sm" onclick="openBV(\\''+p.id+'\\')">View Browser</button> <button class="btn btn-danger btn-sm" onclick="disconnectP(\\''+p.id+'\\')">Disconnect</button>';
+    const err=p.error?'<div class="provider-error">'+escHtml(p.error)+'</div>':'';
+    return '<div class="provider-card"><div class="provider-header"><div class="provider-icon" style="background:'+p.color+'">'+p.icon+'</div><div><div class="provider-name">'+p.name+'</div><div class="provider-company">'+p.company+'</div></div></div><div class="provider-status"><span class="dot '+dot+'"></span>'+st+'</div><div class="provider-reqs">'+p.requests+' requests</div>'+err+btns+'</div>';
+  }).join('');
 }
-
-function renderProviders() {
-  ['ov-providers', 'pv-grid'].forEach(containerId => {
-    const c = document.getElementById(containerId);
-    if (!c) return;
-    c.innerHTML = providers.map(p => {
-      const dotClass = p.status === 'connected' ? 'green' : p.status === 'connecting' ? 'yellow' : 'gray';
-      const statusText = p.status === 'connected' ? 'Connected' : p.status === 'connecting' ? 'Connecting...' : 'Disconnected';
-      const connectBtn = p.status === 'connected'
-        ? '<button class="btn btn-secondary btn-sm" onclick="openBV(\\'' + p.id + '\\')">View Browser</button> <button class="btn btn-danger btn-sm" onclick="disconnectP(\\'' + p.id + '\\')">Disconnect</button>'
-        : p.status === 'connecting'
-        ? '<button class="btn btn-secondary btn-sm" onclick="openBV(\\'' + p.id + '\\')">View Browser</button>'
-        : '<button class="btn btn-primary btn-sm" onclick="connectP(\\'' + p.id + '\\')">Connect</button>';
-      return '<div class="provider-card">' +
-        '<div class="provider-header"><div class="provider-icon" style="background:' + p.color + '">' + p.icon + '</div>' +
-        '<div><div class="provider-name">' + p.name + '</div><div class="provider-company">' + p.company + '</div></div></div>' +
-        '<div class="provider-status"><span class="dot ' + dotClass + '"></span>' + statusText + '</div>' +
-        '<div class="provider-reqs">' + p.requests + ' requests</div>' +
-        connectBtn + '</div>';
-    }).join('');
-  });
-}
-
-function updateOverview() {
-  const connected = providers.filter(p => p.status === 'connected').length;
-  document.getElementById('ov-connected').textContent = connected;
-  document.getElementById('ov-keys').textContent = '0';
-}
-
-function updatePgSelect() {
-  const sel = document.getElementById('pg-provider');
-  const cur = sel.value;
-  sel.innerHTML = '<option value="">Select provider...</option>' +
-    providers.filter(p => p.status === 'connected').map(p =>
-      '<option value="' + p.id + '">' + p.name + '</option>'
-    ).join('');
-  if (cur) sel.value = cur;
-}
-
-async function connectP(id) {
-  try {
-    const r = await fetch('/v1/providers/' + id + '/init', { method: 'POST' });
-    const data = await r.json();
-    if (data.error) { alert('Error: ' + data.error); return; }
+async function connectP(id){
+  if(connecting)return;connecting=true;
+  try{
+    const r=await fetch('/v1/providers/'+id+'/init',{method:'POST'});
+    const d=await r.json();
+    if(d.error){alert('Error: '+d.error);connecting=false;return;}
     openBV(id);
-    loadProviders();
-  } catch (e) { alert('Connection failed: ' + e.message); }
+    loadAll();
+  }catch(e){alert('Connection failed: '+e.message);}
+  connecting=false;
 }
-
-async function disconnectP(id) {
-  try {
-    await fetch('/v1/providers/' + id, { method: 'DELETE' });
-    loadProviders();
-  } catch (e) { alert(e.message); }
-}
-
-// ====== BROWSER VIEW ======
-function openBV(id) {
-  bvProvider = id;
-  const p = providers.find(x => x.id === id);
-  document.getElementById('bv-title').textContent = p ? p.name + ' — Browser View' : id;
+async function disconnectP(id){try{await fetch('/v1/providers/'+id,{method:'DELETE'});loadAll();}catch(e){alert(e.message);}}
+function openBV(id){
+  bvProvider=id;
+  const p=providers.find(x=>x.id===id);
+  document.getElementById('bv-title').textContent=p?p.name+' — Browser View':id;
   document.getElementById('bv-modal').classList.add('show');
-  document.getElementById('bv-msg').textContent = 'Loading...';
-  document.getElementById('bv-dot').className = 'dot yellow';
-  document.getElementById('bv-input').value = '';
+  document.getElementById('bv-msg').textContent='Launching browser...';
+  document.getElementById('bv-dot').className='dot yellow';
+  document.getElementById('bv-input').value='';
+  document.getElementById('bv-loading').style.display='flex';
   bvStartPolling();
 }
-
-function closeBV() {
-  document.getElementById('bv-modal').classList.remove('show');
-  bvStopPolling();
-  bvProvider = null;
-}
-
-function bvStartPolling() {
-  bvStopPolling();
-  bvPollTick();
-  bvPolling = setInterval(bvPollTick, 2000);
-}
-
-function bvStopPolling() { if (bvPolling) { clearInterval(bvPolling); bvPolling = null; } }
-
-async function bvPollTick() {
-  if (!bvProvider) return;
-  try {
-    const r = await fetch('/v1/providers/' + bvProvider + '/screenshot');
-    if (r.ok) {
-      const d = await r.json();
-      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
+function closeBV(){document.getElementById('bv-modal').classList.remove('show');bvStopPolling();bvProvider=null;}
+function bvStartPolling(){bvStopPolling();bvPollTick();bvPolling=setInterval(bvPollTick,2000);}
+function bvStopPolling(){if(bvPolling){clearInterval(bvPolling);bvPolling=null;}}
+async function bvPollTick(){
+  if(!bvProvider)return;
+  try{
+    const r=await fetch('/v1/providers/'+bvProvider+'/screenshot');
+    if(r.ok){const d=await r.json();if(d.screenshot){document.getElementById('bv-img').src='data:image/jpeg;base64,'+d.screenshot;document.getElementById('bv-loading').style.display='none';}}
+    const s=await fetch('/v1/providers');const all=await s.json();providers=all;
+    const p=all.find(x=>x.id===bvProvider);
+    if(p){
+      if(p.status==='connected'){document.getElementById('bv-msg').textContent='Logged in! Close this and use Playground.';document.getElementById('bv-dot').className='dot green';}
+      else if(p.status==='viewing'){document.getElementById('bv-msg').textContent='Page loaded — interact below to log in';document.getElementById('bv-dot').className='dot yellow';}
+      else if(p.error){document.getElementById('bv-msg').textContent='Error: '+p.error;document.getElementById('bv-dot').className='dot red';}
     }
-    // Also detect state
-    const s = await fetch('/v1/providers');
-    const all = await s.json();
-    const p = all.find(x => x.id === bvProvider);
-    if (p) {
-      providers = all;
-      if (p.status === 'connected') {
-        document.getElementById('bv-msg').textContent = 'Connected! You can close this and use the Playground.';
-        document.getElementById('bv-dot').className = 'dot green';
-      }
+    renderAll(all,{totalRequests:0});
+  }catch(e){}
+}
+async function bvClick(event){
+  if(!bvProvider)return;
+  const img=document.getElementById('bv-img');
+  const rect=img.getBoundingClientRect();
+  const x=Math.round((event.clientX-rect.left)/rect.width*1024);
+  const y=Math.round((event.clientY-rect.top)/rect.height*700);
+  const ring=document.createElement('div');ring.className='click-ring';ring.style.left=(event.clientX-rect.left)+'px';ring.style.top=(event.clientY-rect.top)+'px';document.getElementById('bv-screen').appendChild(ring);setTimeout(()=>ring.remove(),500);
+  try{
+    const r=await fetch('/v1/providers/'+bvProvider+'/click',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({x,y})});
+    const d=await r.json();
+    if(d.screenshot)document.getElementById('bv-img').src='data:image/jpeg;base64,'+d.screenshot;
+    if(d.message)document.getElementById('bv-msg').textContent=d.message;
+    if(d.state==='connected'){document.getElementById('bv-dot').className='dot green';loadAll();}
+    else document.getElementById('bv-dot').className='dot yellow';
+  }catch(e){document.getElementById('bv-msg').textContent='Error: '+e.message;}
+}
+async function bvSubmit(){
+  if(!bvProvider)return;
+  const input=document.getElementById('bv-input');const val=input.value.trim();if(!val)return;
+  const msg=document.getElementById('bv-msg').textContent.toLowerCase();
+  let fieldType='text';
+  if(msg.includes('email'))fieldType='email';
+  else if(msg.includes('password'))fieldType='password';
+  else if(msg.includes('code')||msg.includes('verification'))fieldType='code';
+  try{
+    if(fieldType!=='text'){
+      const r=await fetch('/v1/providers/'+bvProvider+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fieldType,value:val})});
+      const d=await r.json();
+      if(d.screenshot)document.getElementById('bv-img').src='data:image/jpeg;base64,'+d.screenshot;
+      if(d.message)document.getElementById('bv-msg').textContent=d.message;
+      if(d.state==='connected'){document.getElementById('bv-dot').className='dot green';loadAll();}else document.getElementById('bv-dot').className='dot yellow';
+    }else{
+      const r=await fetch('/v1/providers/'+bvProvider+'/type',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:val})});
+      const d=await r.json();
+      if(d.screenshot)document.getElementById('bv-img').src='data:image/jpeg;base64,'+d.screenshot;
     }
-  } catch (e) {}
+    input.value='';
+  }catch(e){document.getElementById('bv-msg').textContent='Error: '+e.message;}
 }
-
-async function bvClick(event) {
-  if (!bvProvider) return;
-  const img = document.getElementById('bv-img');
-  const rect = img.getBoundingClientRect();
-  const x = Math.round((event.clientX - rect.left) / rect.width * 1280);
-  const y = Math.round((event.clientY - rect.top) / rect.height * 800);
-
-  // Show click ring
-  const ring = document.createElement('div');
-  ring.className = 'click-ring';
-  ring.style.left = (event.clientX - rect.left) + 'px';
-  ring.style.top = (event.clientY - rect.top) + 'px';
-  document.getElementById('bv-screen').appendChild(ring);
-  setTimeout(() => ring.remove(), 500);
-
-  try {
-    const r = await fetch('/v1/providers/' + bvProvider + '/click', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ x, y })
-    });
-    const d = await r.json();
-    if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
-    if (d.message) document.getElementById('bv-msg').textContent = d.message;
-    if (d.state === 'connected') {
-      document.getElementById('bv-dot').className = 'dot green';
-      loadProviders();
-    } else {
-      document.getElementById('bv-dot').className = 'dot yellow';
-    }
-  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
+async function bvSendKey(key){
+  if(!bvProvider)return;
+  try{const r=await fetch('/v1/providers/'+bvProvider+'/key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});const d=await r.json();if(d.screenshot)document.getElementById('bv-img').src='data:image/jpeg;base64,'+d.screenshot;if(d.message)document.getElementById('bv-msg').textContent=d.message;if(d.state==='connected'){document.getElementById('bv-dot').className='dot green';loadAll();}}catch(e){document.getElementById('bv-msg').textContent='Error: '+e.message;}
 }
-
-async function bvSubmit() {
-  if (!bvProvider) return;
-  const input = document.getElementById('bv-input');
-  const val = input.value.trim();
-  if (!val) return;
-
-  // Detect what type of field we're filling
-  const msg = document.getElementById('bv-msg').textContent.toLowerCase();
-  let fieldType = 'text';
-  if (msg.includes('email')) fieldType = 'email';
-  else if (msg.includes('password')) fieldType = 'password';
-  else if (msg.includes('code') || msg.includes('verification')) fieldType = 'code';
-
-  try {
-    if (fieldType !== 'text') {
-      // Use login endpoint
-      const r = await fetch('/v1/providers/' + bvProvider + '/login', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fieldType, value: val })
-      });
-      const d = await r.json();
-      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
-      if (d.message) document.getElementById('bv-msg').textContent = d.message;
-      if (d.state === 'connected') {
-        document.getElementById('bv-dot').className = 'dot green';
-        loadProviders();
-      } else {
-        document.getElementById('bv-dot').className = 'dot yellow';
-      }
-    } else {
-      // Use type endpoint
-      const r = await fetch('/v1/providers/' + bvProvider + '/type', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: val })
-      });
-      const d = await r.json();
-      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
-    }
-    input.value = '';
-  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
+async function sendMsg(){
+  const input=document.getElementById('chat-input');const provider=document.getElementById('pg-provider').value;const msg=input.value.trim();if(!msg||!provider)return;
+  const msgs=document.getElementById('chat-msgs');
+  msgs.innerHTML+='<div class="msg user"><div class="label">You</div><div class="bubble">'+escHtml(msg)+'</div></div>';
+  msgs.innerHTML+='<div class="msg ai" id="thinking"><div class="label">'+provider+'</div><div class="bubble"><span class="spinner"></span> Thinking...</div></div>';
+  msgs.scrollTop=msgs.scrollHeight;input.value='';
+  try{const r=await fetch('/v1/chat/'+provider,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});const d=await r.json();const t=document.getElementById('thinking');if(t)t.remove();const reply=d.error?'Error: '+d.error:(d.choices&&d.choices[0]?d.choices[0].message.content:'No response');msgs.innerHTML+='<div class="msg ai"><div class="label">'+provider+'</div><div class="bubble">'+escHtml(reply)+'</div></div>';}catch(e){const t=document.getElementById('thinking');if(t)t.remove();msgs.innerHTML+='<div class="msg ai"><div class="label">Error</div><div class="bubble" style="color:var(--red)">'+escHtml(e.message)+'</div></div>';}
+  msgs.scrollTop=msgs.scrollHeight;
 }
-
-async function bvSendKey(key) {
-  if (!bvProvider) return;
-  try {
-    const r = await fetch('/v1/providers/' + bvProvider + '/key', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ key })
-    });
-    const d = await r.json();
-    if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
-    if (d.message) document.getElementById('bv-msg').textContent = d.message;
-    if (d.state === 'connected') {
-      document.getElementById('bv-dot').className = 'dot green';
-      loadProviders();
-    }
-  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
-}
-
-// ====== CHAT ======
-async function sendMsg() {
-  const input = document.getElementById('chat-input');
-  const provider = document.getElementById('pg-provider').value;
-  const msg = input.value.trim();
-  if (!msg || !provider) return;
-
-  const msgs = document.getElementById('chat-msgs');
-  msgs.innerHTML += '<div class="msg user"><div class="label">You</div><div class="bubble">' + escHtml(msg) + '</div></div>';
-  msgs.innerHTML += '<div class="msg ai" id="thinking"><div class="label">' + provider + '</div><div class="bubble"><span class="spinner"></span> Thinking...</div></div>';
-  msgs.scrollTop = msgs.scrollHeight;
-  input.value = '';
-
-  try {
-    const r = await fetch('/v1/chat/' + provider, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: msg })
-    });
-    const d = await r.json();
-    const thinking = document.getElementById('thinking');
-    if (thinking) thinking.remove();
-    const reply = d.error ? 'Error: ' + d.error : (d.choices && d.choices[0] ? d.choices[0].message.content : 'No response');
-    msgs.innerHTML += '<div class="msg ai"><div class="label">' + provider + '</div><div class="bubble">' + escHtml(reply) + '</div></div>';
-  } catch (e) {
-    const thinking = document.getElementById('thinking');
-    if (thinking) thinking.remove();
-    msgs.innerHTML += '<div class="msg ai"><div class="label">Error</div><div class="bubble" style="color:var(--red)">' + escHtml(e.message) + '</div></div>';
-  }
-  msgs.scrollTop = msgs.scrollHeight;
-  loadProviders();
-}
-
-function clearChat() { document.getElementById('chat-msgs').innerHTML = ''; }
-
-function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-// ====== KEYS ======
-async function loadKeys() {
-  try {
-    const r = await fetch('/v1/keys');
-    const keys = await r.json();
-    const body = document.getElementById('keys-body');
-    body.innerHTML = keys.length ? keys.map(k =>
-      '<tr><td>' + escHtml(k.name) + '</td><td><span class="key-value">' + k.key + '</span></td><td>' + new Date(k.created).toLocaleDateString() + '</td><td>' + k.requests + '</td><td><button class="btn btn-danger btn-sm" onclick="revokeKey(\\'' + k.fullKey + '\\')">Revoke</button></td></tr>'
-    ).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--dim);padding:30px">No API keys yet. Click "Generate Key" to create one.</td></tr>';
-    document.getElementById('ov-keys').textContent = keys.length;
-  } catch (e) {}
-}
-
-async function genKey() {
-  const name = prompt('Key name:');
-  if (!name) return;
-  try {
-    const r = await fetch('/v1/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
-    const d = await r.json();
-    alert('Key created: ' + d.key + '\\n\\nSave it now — it won\\'t be shown in full again.');
-    loadKeys();
-  } catch (e) { alert(e.message); }
-}
-
-async function revokeKey(key) {
-  if (!confirm('Revoke this key?')) return;
-  try { await fetch('/v1/keys/' + encodeURIComponent(key), { method: 'DELETE' }); loadKeys(); } catch (e) { alert(e.message); }
-}
-
-// ====== STATS ======
-async function loadStats() {
-  try {
-    const r = await fetch('/v1/stats');
-    const s = await r.json();
-    document.getElementById('ov-requests').textContent = s.totalRequests;
-  } catch (e) {}
-}
-
-// ====== INIT ======
-loadProviders();
-setInterval(loadProviders, 15000);
+function clearChat(){document.getElementById('chat-msgs').innerHTML='';}
+function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+async function loadKeys(){try{const r=await fetch('/v1/keys');const keys=await r.json();const body=document.getElementById('keys-body');body.innerHTML=keys.length?keys.map(k=>'<tr><td>'+escHtml(k.name)+'</td><td><span class="key-value">'+k.key+'</span></td><td>'+new Date(k.created).toLocaleDateString()+'</td><td>'+k.requests+'</td><td><button class="btn btn-danger btn-sm" onclick="revokeKey(\\''+k.fullKey+'\\')">Revoke</button></td></tr>').join(''):'<tr><td colspan="5" style="text-align:center;color:var(--dim);padding:30px">No API keys yet.</td></tr>';document.getElementById('ov-keys').textContent=keys.length;}catch(e){}}
+async function genKey(){const name=prompt('Key name:');if(!name)return;try{const r=await fetch('/v1/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});const d=await r.json();alert('Key created: '+d.key+'\\nSave it now.');loadKeys();}catch(e){alert(e.message);}}
+async function revokeKey(key){if(!confirm('Revoke this key?'))return;try{await fetch('/v1/keys/'+encodeURIComponent(key),{method:'DELETE'});loadKeys();}catch(e){alert(e.message);}}
+loadAll();setInterval(loadAll,15000);
 </script>
-</body>
-</html>`;
+</body></html>`;
 
-// ====== START ======
-app.listen(PORT, () => { console.log('Nova API Gateway v3 on port ' + PORT); });
-
+app.listen(PORT, () => { console.log('Nova API v3.1 on port ' + PORT); });
 process.on('SIGTERM', async () => { if (browser) await browser.close().catch(() => {}); process.exit(0); });
+process.on('uncaughtException', e => { console.error('[CRASH]', e.message); });
+process.on('unhandledRejection', e => { console.error('[REJECT]', e); });
