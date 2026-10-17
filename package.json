@@ -2,9 +2,11 @@
   "name": "nova-api-gateway",
   "version": "2.0.0",
   "main": "chatgpt-bot.js",
+  "engines": {
+    "node": "18.x"
+  },
   "scripts": {
-    "start": "node chatgpt-bot.js",
-    "postinstall": "npx playwright install --with-deps firefox"
+    "start": "node chatgpt-bot.js"
   },
   "dependencies": {
     "express": "^4.21.0",
