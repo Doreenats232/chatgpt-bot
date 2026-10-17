@@ -29,7 +29,7 @@ const contexts = {};
 const pages = {};
 const busy = {};
 const pState = {};
-Object.keys(PROVIDERS).forEach(id => {
+Object.keys(PROVIDERS).forEach(function(id) {
     pState[id] = { connectedAt: null, requests: 0 };
     busy[id] = false;
 });
@@ -48,72 +48,96 @@ async function launchProvider(provider) {
         firefox = playwright.firefox;
     }
 
+    console.log('========================================');
     console.log('[*] Launching Firefox for: ' + provider);
+    console.log('[*] Memory usage: ' + Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB');
 
-    const cookieFile = path.join(COOKIES_DIR, provider + '.json');
-    let storageState;
+    // Check if Firefox binary exists
+    var execPath = firefox.executablePath();
+    console.log('[*] Firefox path: ' + execPath);
+    if (!fs.existsSync(execPath)) {
+        var errMsg = 'Firefox binary NOT FOUND at: ' + execPath + '. Run: npx playwright install --with-deps firefox';
+        console.error('[!] ' + errMsg);
+        throw new Error(errMsg);
+    }
+    console.log('[*] Firefox binary found');
+
+    var cookieFile = path.join(COOKIES_DIR, provider + '.json');
+    var storageState;
     if (fs.existsSync(cookieFile)) {
-        try { storageState = JSON.parse(fs.readFileSync(cookieFile, 'utf8')); } catch {}
+        try { storageState = JSON.parse(fs.readFileSync(cookieFile, 'utf8')); } catch(e) {}
     }
 
-    contexts[provider] = await firefox.launchPersistentContext(
-        path.join(COOKIES_DIR, provider + '-profile'),
-        {
-            headless: true,
-            viewport: { width: 1280, height: 900 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-            locale: 'en-US',
-            timezoneId: 'America/New_York',
-            args: [
-                '--disable-extensions',
-                '--disable-background-networking'
-            ],
-            ...(storageState ? {} : {})
-        }
-    );
+    try {
+        contexts[provider] = await firefox.launchPersistentContext(
+            path.join(COOKIES_DIR, provider + '-profile'),
+            {
+                headless: true,
+                viewport: { width: 1280, height: 900 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+                locale: 'en-US',
+                timezoneId: 'America/New_York',
+                firefoxUserPrefs: {
+                    'media.navigator.enabled': false,
+                    'geo.enabled': false,
+                    'dom.popup_allowed_events': ''
+                }
+            }
+        );
+    } catch(e) {
+        console.error('[!] FIREFOX LAUNCH FAILED for ' + provider + ':');
+        console.error('[!] ' + e.message);
+        stats.errors++;
+        throw new Error('Browser launch failed for ' + provider + ': ' + e.message);
+    }
 
-    const page = contexts[provider].pages()[0] || await contexts[provider].newPage();
+    var page = contexts[provider].pages()[0] || await contexts[provider].newPage();
     pages[provider] = page;
 
-    // Load cookies if we have them
     if (storageState && storageState.cookies) {
-        try {
-            const browserCtx = contexts[provider];
-            await browserCtx.addCookies(storageState.cookies);
-        } catch {}
+        try { await contexts[provider].addCookies(storageState.cookies); } catch(e) {}
     }
 
-    await page.goto(PROVIDERS[provider].url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    console.log('[*] Navigating to ' + PROVIDERS[provider].url);
+    try {
+        await page.goto(PROVIDERS[provider].url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch(e) {
+        console.error('[!] Navigation failed: ' + e.message);
+        console.log('[*] Retrying with load strategy...');
+        await page.goto(PROVIDERS[provider].url, { waitUntil: 'load', timeout: 90000 });
+    }
     await page.waitForTimeout(3000);
 
     pState[provider].connectedAt = Date.now();
     await saveCookies(provider);
     console.log('[*] ' + provider + ' ready');
+    console.log('[*] Memory after launch: ' + Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB');
+    console.log('========================================');
 }
 
 async function saveCookies(provider) {
     try {
         if (!contexts[provider]) return;
-        const cookies = await contexts[provider].cookies();
+        var cookies = await contexts[provider].cookies();
         fs.writeFileSync(
             path.join(COOKIES_DIR, provider + '.json'),
-            JSON.stringify({ cookies }, null, 2)
+            JSON.stringify({ cookies: cookies }, null, 2)
         );
-    } catch {}
+    } catch(e) {}
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 
 // ═══════════════════════════════════════
 // HUMAN TYPING
 // ═══════════════════════════════════════
 async function humanType(page, text) {
-    const sel = '#prompt-textarea, div[contenteditable="true"], textarea, [role="textbox"]';
-    const el = await page.waitForSelector(sel, { timeout: 10000 });
+    var sel = '#prompt-textarea, div[contenteditable="true"], textarea, [role="textbox"]';
+    var el = await page.waitForSelector(sel, { timeout: 10000 });
     await el.click();
     await sleep(300 + Math.random() * 500);
-    for (const c of text) {
-        await page.keyboard.type(c, { delay: 25 + Math.random() * 100 });
+    for (var i = 0; i < text.length; i++) {
+        await page.keyboard.type(text[i], { delay: 25 + Math.random() * 100 });
         if (Math.random() < 0.03) await sleep(150 + Math.random() * 300);
     }
 }
@@ -122,18 +146,18 @@ async function humanType(page, text) {
 // WAIT FOR RESPONSE TO STABILIZE
 // ═══════════════════════════════════════
 async function waitForStable(page, getText, maxWait) {
-    let last = '', stable = 0, waited = 0;
-    const limit = maxWait || 90;
+    var last = '', stable = 0, waited = 0;
+    var limit = maxWait || 90;
     while (stable < 4 && waited < limit) {
         await sleep(1500);
         waited += 1.5;
         try {
-            const t = await getText();
-            const stop = await page.$('button[aria-label="Stop generating"], button[aria-label="Stop"]');
+            var t = await getText();
+            var stop = await page.$('button[aria-label="Stop generating"], button[aria-label="Stop"]');
             if (t === last && !stop && t.length > 0) stable++;
             else stable = 0;
             last = t;
-        } catch { stable = 0; }
+        } catch(e) { stable = 0; }
     }
     return last;
 }
@@ -142,73 +166,85 @@ async function waitForStable(page, getText, maxWait) {
 // PROVIDER SEND FUNCTIONS
 // ═══════════════════════════════════════
 async function sendChatGPT(page, msg) {
-    const before = await page.evaluate(() => document.querySelectorAll('div[data-message-author-role="assistant"]').length);
+    var before = await page.evaluate(function() {
+        return document.querySelectorAll('div[data-message-author-role="assistant"]').length;
+    });
     await humanType(page, msg);
     await sleep(200 + Math.random() * 300);
     try {
-        const btn = await page.waitForSelector('button[data-testid="send-button"], button[aria-label="Send prompt"]', { timeout: 3000 });
+        var btn = await page.waitForSelector('button[data-testid="send-button"], button[aria-label="Send prompt"]', { timeout: 3000 });
         await btn.click();
-    } catch { await page.keyboard.press('Enter'); }
-    await page.waitForFunction(c => document.querySelectorAll('div[data-message-author-role="assistant"]').length > c, { timeout: 120000 }, before);
-    return await waitForStable(page, () => page.evaluate(() => {
-        const m = document.querySelectorAll('div[data-message-author-role="assistant"]');
-        const l = m[m.length - 1];
-        return l ? l.innerText.trim() : '';
-    }));
+    } catch(e) { await page.keyboard.press('Enter'); }
+    await page.waitForFunction(function(c) {
+        return document.querySelectorAll('div[data-message-author-role="assistant"]').length > c;
+    }, { timeout: 120000 }, before);
+    return await waitForStable(page, function() {
+        return page.evaluate(function() {
+            var m = document.querySelectorAll('div[data-message-author-role="assistant"]');
+            var l = m[m.length - 1];
+            return l ? l.innerText.trim() : '';
+        });
+    });
 }
 
 async function sendClaude(page, msg) {
     await humanType(page, msg);
     await sleep(200 + Math.random() * 300);
     try {
-        const btn = await page.waitForSelector('button[aria-label="Send Message"], button[aria-label="Send"]', { timeout: 3000 });
+        var btn = await page.waitForSelector('button[aria-label="Send Message"], button[aria-label="Send"]', { timeout: 3000 });
         await btn.click();
-    } catch { await page.keyboard.press('Enter'); }
+    } catch(e) { await page.keyboard.press('Enter'); }
     await sleep(3000);
-    return await waitForStable(page, () => page.evaluate(() => {
-        const m = document.querySelectorAll('div[class*="Message"]');
-        const l = m[m.length - 1];
-        return l ? l.innerText.trim() : '';
-    }));
+    return await waitForStable(page, function() {
+        return page.evaluate(function() {
+            var m = document.querySelectorAll('div[class*="Message"]');
+            var l = m[m.length - 1];
+            return l ? l.innerText.trim() : '';
+        });
+    });
 }
 
 async function sendGemini(page, msg) {
     await humanType(page, msg);
     await sleep(200 + Math.random() * 300);
     try {
-        const btn = await page.waitForSelector('button[aria-label="Send message"], .send-button', { timeout: 3000 });
+        var btn = await page.waitForSelector('button[aria-label="Send message"], .send-button', { timeout: 3000 });
         await btn.click();
-    } catch { await page.keyboard.press('Enter'); }
+    } catch(e) { await page.keyboard.press('Enter'); }
     await sleep(3000);
-    return await waitForStable(page, () => page.evaluate(() => {
-        const m = document.querySelectorAll('.model-response-text, [class*="response"]');
-        const l = m[m.length - 1];
-        return l ? l.innerText.trim() : '';
-    }));
+    return await waitForStable(page, function() {
+        return page.evaluate(function() {
+            var m = document.querySelectorAll('.model-response-text, [class*="response"]');
+            var l = m[m.length - 1];
+            return l ? l.innerText.trim() : '';
+        });
+    });
 }
 
 async function sendPerplexity(page, msg) {
     await humanType(page, msg);
     await sleep(200 + Math.random() * 300);
     try {
-        const btn = await page.waitForSelector('button[aria-label="Submit"], button[type="submit"]', { timeout: 3000 });
+        var btn = await page.waitForSelector('button[aria-label="Submit"], button[type="submit"]', { timeout: 3000 });
         await btn.click();
-    } catch { await page.keyboard.press('Enter'); }
+    } catch(e) { await page.keyboard.press('Enter'); }
     await sleep(3000);
-    return await waitForStable(page, () => page.evaluate(() => {
-        const m = document.querySelectorAll('.prose, [class*="answer"]');
-        const l = m[m.length - 1];
-        return l ? l.innerText.trim() : '';
-    }));
+    return await waitForStable(page, function() {
+        return page.evaluate(function() {
+            var m = document.querySelectorAll('.prose, [class*="answer"]');
+            var l = m[m.length - 1];
+            return l ? l.innerText.trim() : '';
+        });
+    });
 }
 
-const SENDERS = { chatgpt: sendChatGPT, claude: sendClaude, gemini: sendGemini, perplexity: sendPerplexity };
+var SENDERS = { chatgpt: sendChatGPT, claude: sendClaude, gemini: sendGemini, perplexity: sendPerplexity };
 
 // ═══════════════════════════════════════
 // API KEY MANAGEMENT
 // ═══════════════════════════════════════
 function makeKey() {
-    const key = 'sk-nova-' + crypto.randomBytes(24).toString('hex');
+    var key = 'sk-nova-' + crypto.randomBytes(24).toString('hex');
     apiKeys.set(key, { created: Date.now(), calls: 0, providers: [], revoked: false });
     return key;
 }
@@ -217,51 +253,53 @@ function makeKey() {
 // ROUTES
 // ═══════════════════════════════════════
 
-app.get('/', (_, res) => res.send(HTML()));
+app.get('/', function(_, res) { res.send(HTML()); });
 
-app.get('/v1/providers', (_, res) => {
-    const out = {};
-    for (const [id, p] of Object.entries(PROVIDERS)) {
+app.get('/v1/providers', function(_, res) {
+    var out = {};
+    Object.keys(PROVIDERS).forEach(function(id) {
+        var p = PROVIDERS[id];
         out[id] = {
             name: p.name, desc: p.desc, color: p.color, icon: p.icon,
             connected: !!pages[id],
             uptime: pState[id].connectedAt ? Math.floor((Date.now() - pState[id].connectedAt) / 1000) : 0,
             requests: pState[id].requests
         };
-    }
+    });
     res.json(out);
 });
 
-app.post('/v1/providers/:id/init', async (req, res) => {
-    const { id } = req.params;
+app.post('/v1/providers/:id/init', async function(req, res) {
+    var id = req.params.id;
     if (!PROVIDERS[id]) return res.status(400).json({ error: 'Unknown provider' });
     try {
         await launchProvider(id);
         res.json({ status: 'connected', provider: id, name: PROVIDERS[id].name });
-    } catch (err) {
+    } catch(err) {
         stats.errors++;
+        console.error('[!] /v1/providers/' + id + '/init error: ' + err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-app.post('/v1/providers/:id/newchat', async (req, res) => {
-    const { id } = req.params;
+app.post('/v1/providers/:id/newchat', async function(req, res) {
+    var id = req.params.id;
     if (!pages[id]) return res.status(503).json({ error: 'Not connected' });
     try {
         await pages[id].goto(PROVIDERS[id].url, { waitUntil: 'domcontentloaded', timeout: 30000 });
         await pages[id].waitForTimeout(2000);
         res.json({ ok: true });
-    } catch (err) { res.json({ error: err.message }); }
+    } catch(err) { res.json({ error: err.message }); }
 });
 
-app.post('/v1/keys', (_, res) => {
-    const key = makeKey();
-    res.json({ key, message: 'Save this key. It will not be shown again.' });
+app.post('/v1/keys', function(_, res) {
+    var key = makeKey();
+    res.json({ key: key, message: 'Save this key. It will not be shown again.' });
 });
 
-app.get('/v1/keys', (_, res) => {
-    const out = [];
-    apiKeys.forEach((v, k) => {
+app.get('/v1/keys', function(_, res) {
+    var out = [];
+    apiKeys.forEach(function(v, k) {
         out.push({
             key: k.slice(0, 12) + '...' + k.slice(-4), full: k,
             created: new Date(v.created).toISOString(),
@@ -271,32 +309,32 @@ app.get('/v1/keys', (_, res) => {
     res.json(out);
 });
 
-app.delete('/v1/keys/:key', (req, res) => {
+app.delete('/v1/keys/:key', function(req, res) {
     if (!apiKeys.has(req.params.key)) return res.status(404).json({ error: 'Not found' });
     apiKeys.get(req.params.key).revoked = true;
     res.json({ ok: true });
 });
 
-app.get('/v1/stats', (_, res) => {
-    let totalCalls = 0;
-    apiKeys.forEach(v => totalCalls += v.calls);
+app.get('/v1/stats', function(_, res) {
+    var totalCalls = 0;
+    apiKeys.forEach(function(v) { totalCalls += v.calls; });
     res.json({
-        totalCalls, totalKeys: apiKeys.size,
-        activeKeys: [...apiKeys.values()].filter(v => !v.revoked).length,
-        connectedProviders: Object.keys(PROVIDERS).filter(k => pages[k]).length,
+        totalCalls: totalCalls, totalKeys: apiKeys.size,
+        activeKeys: Array.from(apiKeys.values()).filter(function(v) { return !v.revoked; }).length,
+        connectedProviders: Object.keys(PROVIDERS).filter(function(k) { return pages[k]; }).length,
         uptime: Math.floor((Date.now() - stats.startedAt) / 1000),
         errors: stats.errors
     });
 });
 
-app.post('/v1/chat/:provider', async (req, res) => {
-    const { provider } = req.params;
-    const { message } = req.body;
-    const auth = req.headers.authorization;
+app.post('/v1/chat/:provider', async function(req, res) {
+    var provider = req.params.provider;
+    var message = req.body.message;
+    var auth = req.headers.authorization;
 
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing API key' });
-    const key = auth.replace('Bearer ', '');
-    const kd = apiKeys.get(key);
+    var key = auth.replace('Bearer ', '');
+    var kd = apiKeys.get(key);
     if (!kd || kd.revoked) return res.status(403).json({ error: 'Invalid or revoked key' });
     if (!PROVIDERS[provider]) return res.status(400).json({ error: 'Unknown provider', available: Object.keys(PROVIDERS) });
     if (!pages[provider]) return res.status(503).json({ error: provider + ' not connected. Initialize first.' });
@@ -304,15 +342,15 @@ app.post('/v1/chat/:provider', async (req, res) => {
     if (!message) return res.status(400).json({ error: 'No message' });
 
     busy[provider] = true;
-    const start = Date.now();
+    var start = Date.now();
     try {
-        const reply = await SENDERS[provider](pages[provider], message);
+        var reply = await SENDERS[provider](pages[provider], message);
         await saveCookies(provider);
         kd.calls++;
-        if (!kd.providers.includes(provider)) kd.providers.push(provider);
+        if (kd.providers.indexOf(provider) === -1) kd.providers.push(provider);
         pState[provider].requests++;
-        res.json({ provider, model: PROVIDERS[provider].name, reply, latency: (Date.now() - start) + 'ms' });
-    } catch (err) {
+        res.json({ provider: provider, model: PROVIDERS[provider].name, reply: reply, latency: (Date.now() - start) + 'ms' });
+    } catch(err) {
         stats.errors++;
         res.status(500).json({ error: err.message });
     } finally { busy[provider] = false; }
@@ -326,6 +364,7 @@ function HTML() {
     return '<!DOCTYPE html>\n<html lang="en">\n<head>\n' +
     '<meta charset="UTF-8">\n' +
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+    '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>N</text></svg>">\n' +
     '<title>Nova API — Dashboard</title>\n' +
     '<style>\n' +
     '*{margin:0;padding:0;box-sizing:border-box}\n' +
@@ -411,7 +450,6 @@ function HTML() {
     '.chat-input-wrap textarea:focus{border-color:var(--blue)}\n' +
     '.spinner{display:inline-block;width:13px;height:13px;border:2px solid #1CB7FF44;border-top:2px solid var(--blue);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}\n' +
     '@keyframes spin{to{transform:rotate(360deg)}}\n' +
-    '.loading-btn{pointer-events:none;opacity:.6}\n' +
     '.doc-block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px}\n' +
     '.doc-block .endpoint{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}\n' +
     '.method{padding:3px 10px;border-radius:5px;font-weight:700;font-size:11px;letter-spacing:.5px}\n' +
@@ -542,7 +580,6 @@ function HTML() {
     'function fmtUptime(s){if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m "+(s%60)+"s";return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m"}\n' +
     'function fmtDate(ts){var d=new Date(ts);return d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"})}\n' +
 
-    // LOAD PROVIDERS
     'async function loadProviders(){\n' +
     '  try{\n' +
     '    var res=await fetch("/v1/providers");\n' +
@@ -577,7 +614,6 @@ function HTML() {
     '  var l=document.getElementById("provCountLabel");if(l)l.textContent=Object.keys(providers).length+" providers";\n' +
     '}\n' +
 
-    // INIT PROVIDER
     'async function initProv(id){\n' +
     '  showToast("Connecting to "+id+"... this may take 15-30s","var(--amber)");\n' +
     '  try{\n' +
@@ -589,7 +625,6 @@ function HTML() {
     '  loadProviders();loadStats();\n' +
     '}\n' +
 
-    // STATS
     'async function loadStats(){\n' +
     '  try{\n' +
     '    var res=await fetch("/v1/stats");\n' +
@@ -602,7 +637,6 @@ function HTML() {
     '  }catch(e){}\n' +
     '}\n' +
 
-    // KEYS
     'async function generateKey(){var r=await fetch("/v1/keys",{method:"POST"});var d=await r.json();myKey=d.key;localStorage.setItem("nova_key",myKey);showToast("Key generated!");loadKeys()}\n' +
 
     'async function loadKeys(){\n' +
@@ -628,7 +662,6 @@ function HTML() {
 
     'async function revokeKey(k){if(!confirm("Revoke this key?"))return;await fetch("/v1/keys/"+k,{method:"DELETE"});showToast("Revoked");loadKeys();loadStats()}\n' +
 
-    // PLAYGROUND
     'var chatBox,chatInput,sendBtn;\n' +
     'document.addEventListener("DOMContentLoaded",function(){\n' +
     '  chatBox=document.getElementById("chatBox");\n' +
@@ -678,8 +711,8 @@ function HTML() {
 // ═══════════════════════════════════════
 // START
 // ═══════════════════════════════════════
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+var PORT = process.env.PORT || 3000;
+app.listen(PORT, function() {
     console.log('');
     console.log('  Nova API Gateway v2.0 (Playwright + Firefox)');
     console.log('  http://localhost:' + PORT);
