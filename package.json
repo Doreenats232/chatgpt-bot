@@ -1,6 +1,6 @@
 {
   "name": "nova-api-gateway",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "main": "chatgpt-bot.js",
   "engines": { "node": "20.x" },
   "scripts": { "start": "node chatgpt-bot.js" },
