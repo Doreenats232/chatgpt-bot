@@ -1,721 +1,772 @@
-// Nova API Gateway v2 — Playwright + Firefox
+// ============================================
+//  NOVA API GATEWAY v3
+//  Universal AI Gateway with Browser View
+// ============================================
+
 const express = require('express');
+const { firefox } = require('playwright');
 const crypto = require('crypto');
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
-// ═══════════════════════════════════════
-// STATE
-// ═══════════════════════════════════════
-const apiKeys = new Map();
-const stats = { startedAt: Date.now(), errors: 0 };
-const COOKIES_DIR = path.join(__dirname, 'cookies');
-if (!fs.existsSync(COOKIES_DIR)) fs.mkdirSync(COOKIES_DIR, { recursive: true });
+const PORT = process.env.PORT || 3000;
+const SESSIONS_DIR = path.join(__dirname, 'sessions');
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// ═══════════════════════════════════════
-// PROVIDERS
-// ═══════════════════════════════════════
+// ====== PROVIDERS ======
 const PROVIDERS = {
-    chatgpt:    { name: 'ChatGPT',     url: 'https://chatgpt.com/',               color: '#10a37f', icon: 'G',  desc: 'OpenAI GPT-4o' },
-    claude:     { name: 'Claude',      url: 'https://claude.ai/new',               color: '#d97706', icon: 'C',  desc: 'Anthropic Claude 3.5' },
-    gemini:     { name: 'Gemini',      url: 'https://gemini.google.com/app',       color: '#4285f4', icon: 'Ge', desc: 'Google Gemini Pro' },
-    perplexity: { name: 'Perplexity',  url: 'https://www.perplexity.ai/',           color: '#20b2aa', icon: 'P',  desc: 'Perplexity AI' }
+  chatgpt:    { name: 'ChatGPT',    company: 'OpenAI GPT-4o',       color: '#10a37f', icon: 'G',  url: 'https://chatgpt.com' },
+  claude:     { name: 'Claude',     company: 'Anthropic Claude 3.5', color: '#d97706', icon: 'C',  url: 'https://claude.ai/new' },
+  gemini:     { name: 'Gemini',     company: 'Google Gemini Pro',    color: '#4285f4', icon: 'Ge', url: 'https://gemini.google.com/app' },
+  perplexity: { name: 'Perplexity', company: 'Perplexity AI',        color: '#20b2aa', icon: 'P',  url: 'https://www.perplexity.ai' }
 };
 
-const contexts = {};
+// ====== STATE ======
+let browser = null;
 const pages = {};
-const busy = {};
-const pState = {};
-Object.keys(PROVIDERS).forEach(function(id) {
-    pState[id] = { connectedAt: null, requests: 0 };
-    busy[id] = false;
+const apiKeys = {};
+const stats = { totalRequests: 0, providers: {} };
+Object.keys(PROVIDERS).forEach(id => {
+  stats.providers[id] = { requests: 0, lastUsed: null, status: 'disconnected' };
 });
 
-let playwright;
-let firefox;
+// ====== SESSIONS ======
+function loadSession(id) {
+  try {
+    const f = path.join(SESSIONS_DIR, id + '.json');
+    return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : null;
+  } catch (e) { return null; }
+}
+function saveSession(id, state) {
+  try { fs.writeFileSync(path.join(SESSIONS_DIR, id + '.json'), JSON.stringify(state)); } catch (e) {}
+}
 
-// ═══════════════════════════════════════
-// BROWSER LAUNCH — Firefox (lighter)
-// ═══════════════════════════════════════
-async function launchProvider(provider) {
-    if (contexts[provider]) return;
+// ====== BROWSER ======
+async function getBrowser() {
+  if (browser && browser.isConnected()) return browser;
+  console.log('Launching Firefox...');
+  browser = await firefox.launch({ headless: true, args: ['--no-sandbox'] });
+  browser.on('disconnected', () => {
+    browser = null;
+    Object.keys(pages).forEach(id => { pages[id] = null; });
+    console.log('Browser disconnected');
+  });
+  console.log('Firefox launched');
+  return browser;
+}
 
-    if (!playwright) {
-        playwright = require('playwright');
-        firefox = playwright.firefox;
-    }
+async function initProvider(id) {
+  const config = PROVIDERS[id];
+  if (!config) throw new Error('Unknown provider');
+  if (pages[id]) { try { await pages[id].context.close(); } catch (e) {} }
+  const b = await getBrowser();
+  const saved = loadSession(id);
+  const ctx = await b.newContext({
+    viewport: { width: 1280, height: 800 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+    ...(saved ? { storageState: saved } : {})
+  });
+  const page = await ctx.newPage();
+  try { await page.goto(config.url, { waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (e) {}
+  await page.waitForTimeout(3000);
+  pages[id] = { page, context: ctx, loggedIn: false };
+  const state = await detectState(id);
+  pages[id].loggedIn = state.state === 'connected';
+  if (pages[id].loggedIn) { saveSession(id, await ctx.storageState()); stats.providers[id].status = 'connected'; }
+  return { ...state, screenshot: await getScreenshot(id) };
+}
 
-    console.log('========================================');
-    console.log('[*] Launching Firefox for: ' + provider);
-    console.log('[*] Memory usage: ' + Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB');
+async function detectState(id) {
+  const p = pages[id];
+  if (!p) return { state: 'disconnected', message: 'Not connected' };
+  const page = p.page;
+  const url = page.url();
+  try {
+    const hasEmail = await page.$('input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]');
+    const hasPass = await page.$('input[type="password"]');
+    const hasCode = await page.$('input[name="code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]');
+    const hasChat = await page.$('textarea:not([aria-hidden="true"]), [contenteditable="true"][role="textbox"], #prompt-textarea');
+    if (hasCode) return { state: 'needs_code', message: 'A verification code was sent to your email. Enter it below.' };
+    if (hasPass && !hasChat) return { state: 'needs_password', message: 'Enter your password below.' };
+    if (hasEmail && !hasChat) return { state: 'needs_email', message: 'Enter your email below to log in.' };
+    if (hasChat) return { state: 'connected', message: 'Logged in! Ready to chat.' };
+    if (url.includes('login') || url.includes('auth') || url.includes('signin'))
+      return { state: 'login', message: 'Login page detected. Click on the fields in the browser view or use the input below.' };
+  } catch (e) {}
+  return { state: 'viewing', message: 'Page loaded. Interact with the browser view below.' };
+}
 
-    // Check if Firefox binary exists
-    var execPath = firefox.executablePath();
-    console.log('[*] Firefox path: ' + execPath);
-    if (!fs.existsSync(execPath)) {
-        var errMsg = 'Firefox binary NOT FOUND at: ' + execPath + '. Run: npx playwright install --with-deps firefox';
-        console.error('[!] ' + errMsg);
-        throw new Error(errMsg);
-    }
-    console.log('[*] Firefox binary found');
+async function getScreenshot(id) {
+  const p = pages[id];
+  if (!p) return null;
+  try { return (await p.page.screenshot({ type: 'jpeg', quality: 45 })).toString('base64'); } catch (e) { return null; }
+}
 
-    var cookieFile = path.join(COOKIES_DIR, provider + '.json');
-    var storageState;
-    if (fs.existsSync(cookieFile)) {
-        try { storageState = JSON.parse(fs.readFileSync(cookieFile, 'utf8')); } catch(e) {}
-    }
+async function clickAt(id, x, y) {
+  const p = pages[id]; if (!p) throw new Error('Not connected');
+  await p.page.mouse.click(x, y);
+  await p.page.waitForTimeout(1000);
+  const state = await detectState(id);
+  p.loggedIn = state.state === 'connected';
+  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
+  return { ...state, screenshot: await getScreenshot(id) };
+}
 
-    try {
-        contexts[provider] = await firefox.launchPersistentContext(
-            path.join(COOKIES_DIR, provider + '-profile'),
-            {
-                headless: true,
-                viewport: { width: 1280, height: 900 },
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
-                locale: 'en-US',
-                timezoneId: 'America/New_York',
-                firefoxUserPrefs: {
-                    'media.navigator.enabled': false,
-                    'geo.enabled': false,
-                    'dom.popup_allowed_events': ''
-                }
-            }
-        );
-    } catch(e) {
-        console.error('[!] FIREFOX LAUNCH FAILED for ' + provider + ':');
-        console.error('[!] ' + e.message);
-        stats.errors++;
-        throw new Error('Browser launch failed for ' + provider + ': ' + e.message);
-    }
+async function typeText(id, text) {
+  const p = pages[id]; if (!p) throw new Error('Not connected');
+  await p.page.keyboard.type(text, { delay: 25 });
+  return { screenshot: await getScreenshot(id) };
+}
 
-    var page = contexts[provider].pages()[0] || await contexts[provider].newPage();
-    pages[provider] = page;
+async function pressKey(id, key) {
+  const p = pages[id]; if (!p) throw new Error('Not connected');
+  await p.page.keyboard.press(key);
+  await p.page.waitForTimeout(1500);
+  const state = await detectState(id);
+  p.loggedIn = state.state === 'connected';
+  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
+  return { ...state, screenshot: await getScreenshot(id) };
+}
 
-    if (storageState && storageState.cookies) {
-        try { await contexts[provider].addCookies(storageState.cookies); } catch(e) {}
-    }
+async function fillLogin(id, fieldType, value) {
+  const p = pages[id]; if (!p) throw new Error('Not connected');
+  const page = p.page;
+  const sel = fieldType === 'email' ? 'input[type="email"], input[name="email"], input[name="username"]'
+    : fieldType === 'password' ? 'input[type="password"]'
+    : 'input[name="code"], input[inputmode="numeric"], input[autocomplete="one-time-code"], input[type="tel"]';
+  const input = await page.waitForSelector(sel, { timeout: 8000 });
+  await input.click();
+  await input.fill(value);
+  await page.waitForTimeout(300);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(4000);
+  const state = await detectState(id);
+  p.loggedIn = state.state === 'connected';
+  if (p.loggedIn) { saveSession(id, await p.context.storageState()); stats.providers[id].status = 'connected'; }
+  return { ...state, screenshot: await getScreenshot(id) };
+}
 
-    console.log('[*] Navigating to ' + PROVIDERS[provider].url);
-    try {
-        await page.goto(PROVIDERS[provider].url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch(e) {
-        console.error('[!] Navigation failed: ' + e.message);
-        console.log('[*] Retrying with load strategy...');
-        await page.goto(PROVIDERS[provider].url, { waitUntil: 'load', timeout: 90000 });
-    }
+async function sendChatMessage(id, message) {
+  const p = pages[id]; if (!p) throw new Error('Not connected');
+  if (!p.loggedIn) throw new Error('Not logged in — connect and log in first.');
+  const page = p.page;
+
+  // Navigate to new chat if possible
+  try {
+    const newChat = await page.$('a[href="/"], a[href="/new"], a[href="/app"], nav a:first-child');
+    if (newChat) { await newChat.click(); await page.waitForTimeout(2000); }
+  } catch (e) {}
+
+  // Find and focus input
+  const input = await page.locator('textarea, [contenteditable="true"][role="textbox"], #prompt-textarea').first();
+  await input.click();
+  await page.waitForTimeout(300);
+
+  // Type message
+  try { await input.fill(message); } catch (e) { await page.keyboard.type(message, { delay: 15 }); }
+  await page.waitForTimeout(500);
+
+  // Count existing responses
+  const before = await page.evaluate(() =>
+    document.querySelectorAll('[data-message-author-role="assistant"], .font-claude-message, .response-content, .prose').length
+  );
+
+  // Send
+  try { await page.keyboard.press('Enter'); } catch (e) {}
+  const deadline = Date.now() + 90000;
+  let response = '';
+
+  while (Date.now() < deadline) {
     await page.waitForTimeout(3000);
-
-    pState[provider].connectedAt = Date.now();
-    await saveCookies(provider);
-    console.log('[*] ' + provider + ' ready');
-    console.log('[*] Memory after launch: ' + Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB');
-    console.log('========================================');
-}
-
-async function saveCookies(provider) {
-    try {
-        if (!contexts[provider]) return;
-        var cookies = await contexts[provider].cookies();
-        fs.writeFileSync(
-            path.join(COOKIES_DIR, provider + '.json'),
-            JSON.stringify({ cookies: cookies }, null, 2)
-        );
-    } catch(e) {}
-}
-
-function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
-
-// ═══════════════════════════════════════
-// HUMAN TYPING
-// ═══════════════════════════════════════
-async function humanType(page, text) {
-    var sel = '#prompt-textarea, div[contenteditable="true"], textarea, [role="textbox"]';
-    var el = await page.waitForSelector(sel, { timeout: 10000 });
-    await el.click();
-    await sleep(300 + Math.random() * 500);
-    for (var i = 0; i < text.length; i++) {
-        await page.keyboard.type(text[i], { delay: 25 + Math.random() * 100 });
-        if (Math.random() < 0.03) await sleep(150 + Math.random() * 300);
+    const texts = await page.evaluate(() => {
+      const els = document.querySelectorAll('[data-message-author-role="assistant"], .font-claude-message, .response-content, .prose');
+      return Array.from(els).map(e => e.innerText);
+    });
+    if (texts.length > before && texts[texts.length - 1].length > 10) {
+      let last = texts[texts.length - 1];
+      let stable = 0;
+      while (stable < 2 && Date.now() < deadline) {
+        await page.waitForTimeout(2000);
+        const cur = await page.evaluate(() => {
+          const els = document.querySelectorAll('[data-message-author-role="assistant"], .font-claude-message, .response-content, .prose');
+          const a = Array.from(els);
+          return a.length > 0 ? a[a.length - 1].innerText : '';
+        });
+        if (cur === last) stable++; else { stable = 0; last = cur; }
+      }
+      response = last;
+      break;
     }
+  }
+
+  if (!response) response = 'No response received — the AI may still be processing or the page layout changed.';
+  stats.totalRequests++;
+  stats.providers[id].requests++;
+  stats.providers[id].lastUsed = new Date().toISOString();
+  try { saveSession(id, await p.context.storageState()); } catch (e) {}
+  return response;
 }
 
-// ═══════════════════════════════════════
-// WAIT FOR RESPONSE TO STABILIZE
-// ═══════════════════════════════════════
-async function waitForStable(page, getText, maxWait) {
-    var last = '', stable = 0, waited = 0;
-    var limit = maxWait || 90;
-    while (stable < 4 && waited < limit) {
-        await sleep(1500);
-        waited += 1.5;
-        try {
-            var t = await getText();
-            var stop = await page.$('button[aria-label="Stop generating"], button[aria-label="Stop"]');
-            if (t === last && !stop && t.length > 0) stable++;
-            else stable = 0;
-            last = t;
-        } catch(e) { stable = 0; }
+async function closeProvider(id) {
+  if (pages[id]) { try { await pages[id].context.close(); } catch (e) {} pages[id] = null; }
+  stats.providers[id].status = 'disconnected';
+}
+
+// ====== ROUTES ======
+app.get('/v1/providers', (req, res) => {
+  res.json(Object.entries(PROVIDERS).map(([id, c]) => ({
+    id, ...c,
+    status: pages[id]?.loggedIn ? 'connected' : pages[id] ? 'connecting' : 'disconnected',
+    requests: stats.providers[id]?.requests || 0
+  })));
+});
+app.post('/v1/providers/:id/init', async (req, res) => {
+  try { res.json(await initProvider(req.params.id)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/v1/providers/:id', async (req, res) => {
+  try { await closeProvider(req.params.id); res.json({ ok: true }); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/v1/providers/:id/screenshot', async (req, res) => {
+  try { const s = await getScreenshot(req.params.id); s ? res.json({ screenshot: s }) : res.status(404).json({ error: 'No screenshot' }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/v1/providers/:id/click', async (req, res) => {
+  try { res.json(await clickAt(req.params.id, req.body.x, req.body.y)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/v1/providers/:id/type', async (req, res) => {
+  try { res.json(await typeText(req.params.id, req.body.text)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/v1/providers/:id/key', async (req, res) => {
+  try { res.json(await pressKey(req.params.id, req.body.key)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/v1/providers/:id/login', async (req, res) => {
+  try { res.json(await fillLogin(req.params.id, req.body.fieldType, req.body.value)); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/v1/chat/:provider', async (req, res) => {
+  try {
+    const response = await sendChatMessage(req.params.provider, req.body.message);
+    res.json({ id: 'chatcmpl-' + crypto.randomBytes(8).toString('hex'), object: 'chat.completion',
+      model: PROVIDERS[req.params.provider]?.name, choices: [{ index: 0, message: { role: 'assistant', content: response }, finish_reason: 'stop' }] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/v1/keys', (req, res) => { res.json(Object.entries(apiKeys).map(([k, d]) => ({ key: k.slice(0, 8) + '...' + k.slice(-4), fullKey: k, ...d }))); });
+app.post('/v1/keys', (req, res) => {
+  const key = 'nva-' + crypto.randomBytes(24).toString('hex');
+  apiKeys[key] = { name: req.body.name || 'Unnamed', created: new Date().toISOString(), requests: 0 };
+  res.json({ key, ...apiKeys[key] });
+});
+app.delete('/v1/keys/:key', (req, res) => {
+  if (apiKeys[req.params.key]) { delete apiKeys[req.params.key]; res.json({ ok: true }); } else res.status(404).json({ error: 'Not found' });
+});
+app.get('/v1/stats', (req, res) => { res.json(stats); });
+app.get('/health', (req, res) => { res.json({ status: 'ok', uptime: process.uptime() }); });
+
+// ====== FRONTEND ======
+app.get('/', (req, res) => { res.send(HTML); });
+
+const HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nova API</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#06060f;--surface:#0c0c18;--card:#111122;--border:#1a1a30;--text:#e0e0f0;--dim:#7070a0;--accent:#6366f1;--accent2:#a855f7;--green:#22c55e;--red:#ef4444;--yellow:#f59e0b;--grad:linear-gradient(135deg,#6366f1,#a855f7)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.app{display:flex;min-height:100vh}
+.sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);padding:20px 0;flex-shrink:0;position:fixed;top:0;left:0;bottom:0;z-index:100}
+.logo{padding:0 20px 24px;font-size:20px;font-weight:700;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.nav-item{display:flex;align-items:center;gap:10px;padding:10px 20px;color:var(--dim);cursor:pointer;font-size:14px;transition:.2s;border-left:3px solid transparent}
+.nav-item:hover,.nav-item.active{color:var(--text);background:rgba(99,102,241,.08);border-left-color:var(--accent)}
+.nav-section{padding:16px 20px 6px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--dim)}
+.main{margin-left:220px;flex:1;padding:28px 32px;min-height:100vh}
+.page{display:none}.page.active{display:block}
+h1{font-size:24px;margin-bottom:20px}
+h2{font-size:18px;margin-bottom:16px;color:var(--dim)}
+.stats-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:28px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
+.stat-label{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+.stat-value{font-size:28px;font-weight:700;margin-top:4px}
+.providers-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.provider-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;transition:.2s}
+.provider-card:hover{border-color:var(--accent);transform:translateY(-2px)}
+.provider-header{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.provider-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff}
+.provider-name{font-size:16px;font-weight:600}
+.provider-company{font-size:12px;color:var(--dim)}
+.provider-status{display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:14px}
+.dot{width:8px;height:8px;border-radius:50%}
+.dot.green{background:var(--green)}.dot.yellow{background:var(--yellow)}.dot.gray{background:#555}
+.provider-reqs{font-size:12px;color:var(--dim);margin-bottom:14px}
+.btn{padding:8px 16px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:.2s;display:inline-flex;align-items:center;gap:6px}
+.btn-primary{background:var(--grad);color:#fff}.btn-primary:hover{opacity:.85}
+.btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}.btn-danger:hover{background:rgba(239,68,68,.25)}
+.btn-secondary{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--border)}.btn-secondary:hover{background:rgba(255,255,255,.1)}
+.btn-sm{padding:6px 12px;font-size:12px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.keys-table{width:100%;border-collapse:collapse;margin-top:16px}
+.keys-table th,.keys-table td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);font-size:13px}
+.keys-table th{color:var(--dim);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.key-value{font-family:monospace;font-size:12px;background:rgba(255,255,255,.04);padding:4px 8px;border-radius:4px}
+.playground-area{display:flex;flex-direction:column;height:calc(100vh - 140px)}
+.pg-header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+select{background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:13px;cursor:pointer}
+select:focus{outline:none;border-color:var(--accent)}
+.chat-messages{flex:1;overflow-y:auto;padding:16px;background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:12px}
+.msg{margin-bottom:12px;max-width:80%}
+.msg.user{margin-left:auto;text-align:right}
+.msg .bubble{display:inline-block;padding:10px 14px;border-radius:12px;font-size:14px;line-height:1.5}
+.msg.user .bubble{background:var(--accent);color:#fff}
+.msg.ai .bubble{background:rgba(255,255,255,.06);border:1px solid var(--border)}
+.msg .label{font-size:11px;color:var(--dim);margin-bottom:4px}
+.chat-input-row{display:flex;gap:8px}
+.chat-input-row input{flex:1;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:12px 16px;font-size:14px}
+.chat-input-row input:focus{outline:none;border-color:var(--accent)}
+.docs-content{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:24px;font-size:14px;line-height:1.8}
+.docs-content code{background:rgba(255,255,255,.06);padding:2px 6px;border-radius:4px;font-size:13px}
+.docs-content pre{background:rgba(0,0,0,.3);padding:16px;border-radius:8px;overflow-x:auto;margin:12px 0;font-size:13px}
+.endpoint{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)}
+.method{font-size:11px;font-weight:700;padding:3px 8px;border-radius:4px;min-width:50px;text-align:center}
+.method.get{background:rgba(34,197,94,.15);color:var(--green)}.method.post{background:rgba(99,102,241,.15);color:var(--accent)}.method.delete{background:rgba(239,68,68,.15);color:var(--red)}
+.ep-path{font-family:monospace;font-size:13px}
+
+/* Browser View Modal */
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.8);z-index:1000;align-items:center;justify-content:center}
+.modal-overlay.show{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;width:95%;max-width:1000px;max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-top{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;border-bottom:1px solid var(--border)}
+.modal-top h3{font-size:15px;font-weight:600}
+.close-btn{background:none;border:none;color:var(--dim);font-size:22px;cursor:pointer;padding:4px 8px}.close-btn:hover{color:var(--text)}
+.bv-screen{position:relative;background:#000;border-radius:8px;overflow:hidden;margin:16px 20px 0;cursor:crosshair}
+.bv-screen img{width:100%;display:block;pointer-events:none}
+.bv-screen .click-ring{position:absolute;width:20px;height:20px;border:2px solid var(--accent);border-radius:50%;transform:translate(-50%,-50%);pointer-events:none;animation:ping .4s ease-out forwards}
+@keyframes ping{0%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-50%) scale(2)}}
+.bv-status{display:flex;align-items:center;gap:8px;padding:10px 20px;font-size:13px}
+.bv-status .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.bv-controls{display:flex;gap:8px;padding:0 20px 16px}
+.bv-controls input{flex:1;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:13px}
+.bv-controls input:focus{outline:none;border-color:var(--accent)}
+.bv-hint{padding:0 20px 14px;font-size:11px;color:var(--dim)}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--dim);border-top-color:var(--accent);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hidden{display:none!important}
+</style>
+</head>
+<body>
+<div class="app">
+<nav class="sidebar">
+<div class="logo">Nova API</div>
+<div class="nav-item active" onclick="nav('overview')">Overview</div>
+<div class="nav-section">Dashboard</div>
+<div class="nav-item" onclick="nav('providers')">Providers</div>
+<div class="nav-section">Management</div>
+<div class="nav-item" onclick="nav('keys')">API Keys</div>
+<div class="nav-section">Tools</div>
+<div class="nav-item" onclick="nav('playground')">Playground</div>
+<div class="nav-item" onclick="nav('docs')">API Docs</div>
+</nav>
+<div class="main">
+
+<!-- OVERVIEW -->
+<div class="page active" id="page-overview">
+<h1>Overview</h1>
+<div class="stats-row">
+<div class="stat-card"><div class="stat-label">Connected</div><div class="stat-value" id="ov-connected">0</div></div>
+<div class="stat-card"><div class="stat-label">Total Requests</div><div class="stat-value" id="ov-requests">0</div></div>
+<div class="stat-card"><div class="stat-label">API Keys</div><div class="stat-value" id="ov-keys">0</div></div>
+</div>
+<h2>Providers</h2>
+<div class="providers-grid" id="ov-providers"></div>
+</div>
+
+<!-- PROVIDERS -->
+<div class="page" id="page-providers">
+<h1>Providers</h1>
+<div class="providers-grid" id="pv-grid"></div>
+</div>
+
+<!-- KEYS -->
+<div class="page" id="page-keys">
+<div style="display:flex;align-items:center;justify-content:space-between">
+<h1>API Keys</h1>
+<button class="btn btn-primary" onclick="genKey()">+ Generate Key</button>
+</div>
+<table class="keys-table"><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Requests</th><th></th></tr></thead><tbody id="keys-body"></tbody></table>
+</div>
+
+<!-- PLAYGROUND -->
+<div class="page" id="page-playground">
+<h1>Playground</h1>
+<div class="playground-area">
+<div class="pg-header">
+<select id="pg-provider"><option value="">Select provider...</option></select>
+<button class="btn btn-secondary btn-sm" onclick="clearChat()">Clear</button>
+</div>
+<div class="chat-messages" id="chat-msgs"></div>
+<div class="chat-input-row">
+<input id="chat-input" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendMsg()">
+<button class="btn btn-primary" onclick="sendMsg()">Send</button>
+</div>
+</div>
+</div>
+
+<!-- DOCS -->
+<div class="page" id="page-docs">
+<h1>API Docs</h1>
+<div class="docs-content">
+<h2>Endpoints</h2>
+<div class="endpoint"><span class="method get">GET</span><span class="ep-path">/v1/providers</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/providers/:id/init</span></div>
+<div class="endpoint"><span class="method delete">DEL</span><span class="ep-path">/v1/providers/:id</span></div>
+<div class="endpoint"><span class="method get">GET</span><span class="ep-path">/v1/providers/:id/screenshot</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/providers/:id/click</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/providers/:id/type</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/providers/:id/key</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/providers/:id/login</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/chat/:provider</span></div>
+<div class="endpoint"><span class="method get">GET</span><span class="ep-path">/v1/keys</span></div>
+<div class="endpoint"><span class="method post">POST</span><span class="ep-path">/v1/keys</span></div>
+<div class="endpoint"><span class="method delete">DEL</span><span class="ep-path">/v1/keys/:key</span></div>
+<div class="endpoint"><span class="method get">GET</span><span class="ep-path">/v1/stats</span></div>
+<br>
+<h2>Usage</h2>
+<pre>curl -X POST /v1/chat/chatgpt \\
+  -H "Content-Type: application/json" \\
+  -d '{"message": "Hello!"}'</pre>
+<p>Responses follow OpenAI-compatible format.</p>
+</div>
+</div>
+
+</div>
+</div>
+
+<!-- BROWSER VIEW MODAL -->
+<div class="modal-overlay" id="bv-modal">
+<div class="modal-box">
+<div class="modal-top">
+<h3 id="bv-title">Provider</h3>
+<button class="close-btn" onclick="closeBV()">&times;</button>
+</div>
+<div class="bv-screen" id="bv-screen" onclick="bvClick(event)">
+<img id="bv-img" src="">
+</div>
+<div class="bv-status"><span class="dot gray" id="bv-dot"></span><span id="bv-msg">Loading...</span></div>
+<div class="bv-controls">
+<input id="bv-input" type="text" placeholder="Type here and press Enter..." onkeydown="if(event.key==='Enter'){bvSubmit();event.preventDefault()}">
+<button class="btn btn-primary btn-sm" onclick="bvSubmit()">Submit</button>
+<button class="btn btn-secondary btn-sm" onclick="bvSendKey('Enter')">Enter</button>
+<button class="btn btn-secondary btn-sm" onclick="bvSendKey('Tab')">Tab</button>
+</div>
+<div class="bv-hint">Click anywhere on the browser image to interact. Type in the field below to enter text. Use Enter/Tab buttons for special keys.</div>
+</div>
+</div>
+
+<script>
+let bvProvider = null;
+let bvPolling = null;
+let providers = [];
+
+function nav(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('page-' + page).classList.add('active');
+  event.target.classList.add('active');
+  if (page === 'providers' || page === 'overview') loadProviders();
+  if (page === 'keys') loadKeys();
+  if (page === 'playground') loadProviders();
+  if (page === 'overview') loadStats();
+}
+
+async function loadProviders() {
+  try {
+    const r = await fetch('/v1/providers');
+    providers = await r.json();
+    renderProviders();
+    updateOverview();
+    updatePgSelect();
+  } catch (e) { console.error(e); }
+}
+
+function renderProviders() {
+  ['ov-providers', 'pv-grid'].forEach(containerId => {
+    const c = document.getElementById(containerId);
+    if (!c) return;
+    c.innerHTML = providers.map(p => {
+      const dotClass = p.status === 'connected' ? 'green' : p.status === 'connecting' ? 'yellow' : 'gray';
+      const statusText = p.status === 'connected' ? 'Connected' : p.status === 'connecting' ? 'Connecting...' : 'Disconnected';
+      const connectBtn = p.status === 'connected'
+        ? '<button class="btn btn-secondary btn-sm" onclick="openBV(\\'' + p.id + '\\')">View Browser</button> <button class="btn btn-danger btn-sm" onclick="disconnectP(\\'' + p.id + '\\')">Disconnect</button>'
+        : p.status === 'connecting'
+        ? '<button class="btn btn-secondary btn-sm" onclick="openBV(\\'' + p.id + '\\')">View Browser</button>'
+        : '<button class="btn btn-primary btn-sm" onclick="connectP(\\'' + p.id + '\\')">Connect</button>';
+      return '<div class="provider-card">' +
+        '<div class="provider-header"><div class="provider-icon" style="background:' + p.color + '">' + p.icon + '</div>' +
+        '<div><div class="provider-name">' + p.name + '</div><div class="provider-company">' + p.company + '</div></div></div>' +
+        '<div class="provider-status"><span class="dot ' + dotClass + '"></span>' + statusText + '</div>' +
+        '<div class="provider-reqs">' + p.requests + ' requests</div>' +
+        connectBtn + '</div>';
+    }).join('');
+  });
+}
+
+function updateOverview() {
+  const connected = providers.filter(p => p.status === 'connected').length;
+  document.getElementById('ov-connected').textContent = connected;
+  document.getElementById('ov-keys').textContent = '0';
+}
+
+function updatePgSelect() {
+  const sel = document.getElementById('pg-provider');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Select provider...</option>' +
+    providers.filter(p => p.status === 'connected').map(p =>
+      '<option value="' + p.id + '">' + p.name + '</option>'
+    ).join('');
+  if (cur) sel.value = cur;
+}
+
+async function connectP(id) {
+  try {
+    const r = await fetch('/v1/providers/' + id + '/init', { method: 'POST' });
+    const data = await r.json();
+    if (data.error) { alert('Error: ' + data.error); return; }
+    openBV(id);
+    loadProviders();
+  } catch (e) { alert('Connection failed: ' + e.message); }
+}
+
+async function disconnectP(id) {
+  try {
+    await fetch('/v1/providers/' + id, { method: 'DELETE' });
+    loadProviders();
+  } catch (e) { alert(e.message); }
+}
+
+// ====== BROWSER VIEW ======
+function openBV(id) {
+  bvProvider = id;
+  const p = providers.find(x => x.id === id);
+  document.getElementById('bv-title').textContent = p ? p.name + ' — Browser View' : id;
+  document.getElementById('bv-modal').classList.add('show');
+  document.getElementById('bv-msg').textContent = 'Loading...';
+  document.getElementById('bv-dot').className = 'dot yellow';
+  document.getElementById('bv-input').value = '';
+  bvStartPolling();
+}
+
+function closeBV() {
+  document.getElementById('bv-modal').classList.remove('show');
+  bvStopPolling();
+  bvProvider = null;
+}
+
+function bvStartPolling() {
+  bvStopPolling();
+  bvPollTick();
+  bvPolling = setInterval(bvPollTick, 2000);
+}
+
+function bvStopPolling() { if (bvPolling) { clearInterval(bvPolling); bvPolling = null; } }
+
+async function bvPollTick() {
+  if (!bvProvider) return;
+  try {
+    const r = await fetch('/v1/providers/' + bvProvider + '/screenshot');
+    if (r.ok) {
+      const d = await r.json();
+      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
     }
-    return last;
-}
-
-// ═══════════════════════════════════════
-// PROVIDER SEND FUNCTIONS
-// ═══════════════════════════════════════
-async function sendChatGPT(page, msg) {
-    var before = await page.evaluate(function() {
-        return document.querySelectorAll('div[data-message-author-role="assistant"]').length;
-    });
-    await humanType(page, msg);
-    await sleep(200 + Math.random() * 300);
-    try {
-        var btn = await page.waitForSelector('button[data-testid="send-button"], button[aria-label="Send prompt"]', { timeout: 3000 });
-        await btn.click();
-    } catch(e) { await page.keyboard.press('Enter'); }
-    await page.waitForFunction(function(c) {
-        return document.querySelectorAll('div[data-message-author-role="assistant"]').length > c;
-    }, { timeout: 120000 }, before);
-    return await waitForStable(page, function() {
-        return page.evaluate(function() {
-            var m = document.querySelectorAll('div[data-message-author-role="assistant"]');
-            var l = m[m.length - 1];
-            return l ? l.innerText.trim() : '';
-        });
-    });
-}
-
-async function sendClaude(page, msg) {
-    await humanType(page, msg);
-    await sleep(200 + Math.random() * 300);
-    try {
-        var btn = await page.waitForSelector('button[aria-label="Send Message"], button[aria-label="Send"]', { timeout: 3000 });
-        await btn.click();
-    } catch(e) { await page.keyboard.press('Enter'); }
-    await sleep(3000);
-    return await waitForStable(page, function() {
-        return page.evaluate(function() {
-            var m = document.querySelectorAll('div[class*="Message"]');
-            var l = m[m.length - 1];
-            return l ? l.innerText.trim() : '';
-        });
-    });
-}
-
-async function sendGemini(page, msg) {
-    await humanType(page, msg);
-    await sleep(200 + Math.random() * 300);
-    try {
-        var btn = await page.waitForSelector('button[aria-label="Send message"], .send-button', { timeout: 3000 });
-        await btn.click();
-    } catch(e) { await page.keyboard.press('Enter'); }
-    await sleep(3000);
-    return await waitForStable(page, function() {
-        return page.evaluate(function() {
-            var m = document.querySelectorAll('.model-response-text, [class*="response"]');
-            var l = m[m.length - 1];
-            return l ? l.innerText.trim() : '';
-        });
-    });
-}
-
-async function sendPerplexity(page, msg) {
-    await humanType(page, msg);
-    await sleep(200 + Math.random() * 300);
-    try {
-        var btn = await page.waitForSelector('button[aria-label="Submit"], button[type="submit"]', { timeout: 3000 });
-        await btn.click();
-    } catch(e) { await page.keyboard.press('Enter'); }
-    await sleep(3000);
-    return await waitForStable(page, function() {
-        return page.evaluate(function() {
-            var m = document.querySelectorAll('.prose, [class*="answer"]');
-            var l = m[m.length - 1];
-            return l ? l.innerText.trim() : '';
-        });
-    });
-}
-
-var SENDERS = { chatgpt: sendChatGPT, claude: sendClaude, gemini: sendGemini, perplexity: sendPerplexity };
-
-// ═══════════════════════════════════════
-// API KEY MANAGEMENT
-// ═══════════════════════════════════════
-function makeKey() {
-    var key = 'sk-nova-' + crypto.randomBytes(24).toString('hex');
-    apiKeys.set(key, { created: Date.now(), calls: 0, providers: [], revoked: false });
-    return key;
-}
-
-// ═══════════════════════════════════════
-// ROUTES
-// ═══════════════════════════════════════
-
-app.get('/', function(_, res) { res.send(HTML()); });
-
-app.get('/v1/providers', function(_, res) {
-    var out = {};
-    Object.keys(PROVIDERS).forEach(function(id) {
-        var p = PROVIDERS[id];
-        out[id] = {
-            name: p.name, desc: p.desc, color: p.color, icon: p.icon,
-            connected: !!pages[id],
-            uptime: pState[id].connectedAt ? Math.floor((Date.now() - pState[id].connectedAt) / 1000) : 0,
-            requests: pState[id].requests
-        };
-    });
-    res.json(out);
-});
-
-app.post('/v1/providers/:id/init', async function(req, res) {
-    var id = req.params.id;
-    if (!PROVIDERS[id]) return res.status(400).json({ error: 'Unknown provider' });
-    try {
-        await launchProvider(id);
-        res.json({ status: 'connected', provider: id, name: PROVIDERS[id].name });
-    } catch(err) {
-        stats.errors++;
-        console.error('[!] /v1/providers/' + id + '/init error: ' + err.message);
-        res.status(500).json({ error: err.message });
+    // Also detect state
+    const s = await fetch('/v1/providers');
+    const all = await s.json();
+    const p = all.find(x => x.id === bvProvider);
+    if (p) {
+      providers = all;
+      if (p.status === 'connected') {
+        document.getElementById('bv-msg').textContent = 'Connected! You can close this and use the Playground.';
+        document.getElementById('bv-dot').className = 'dot green';
+      }
     }
-});
-
-app.post('/v1/providers/:id/newchat', async function(req, res) {
-    var id = req.params.id;
-    if (!pages[id]) return res.status(503).json({ error: 'Not connected' });
-    try {
-        await pages[id].goto(PROVIDERS[id].url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        await pages[id].waitForTimeout(2000);
-        res.json({ ok: true });
-    } catch(err) { res.json({ error: err.message }); }
-});
-
-app.post('/v1/keys', function(_, res) {
-    var key = makeKey();
-    res.json({ key: key, message: 'Save this key. It will not be shown again.' });
-});
-
-app.get('/v1/keys', function(_, res) {
-    var out = [];
-    apiKeys.forEach(function(v, k) {
-        out.push({
-            key: k.slice(0, 12) + '...' + k.slice(-4), full: k,
-            created: new Date(v.created).toISOString(),
-            calls: v.calls, providers: v.providers, revoked: v.revoked
-        });
-    });
-    res.json(out);
-});
-
-app.delete('/v1/keys/:key', function(req, res) {
-    if (!apiKeys.has(req.params.key)) return res.status(404).json({ error: 'Not found' });
-    apiKeys.get(req.params.key).revoked = true;
-    res.json({ ok: true });
-});
-
-app.get('/v1/stats', function(_, res) {
-    var totalCalls = 0;
-    apiKeys.forEach(function(v) { totalCalls += v.calls; });
-    res.json({
-        totalCalls: totalCalls, totalKeys: apiKeys.size,
-        activeKeys: Array.from(apiKeys.values()).filter(function(v) { return !v.revoked; }).length,
-        connectedProviders: Object.keys(PROVIDERS).filter(function(k) { return pages[k]; }).length,
-        uptime: Math.floor((Date.now() - stats.startedAt) / 1000),
-        errors: stats.errors
-    });
-});
-
-app.post('/v1/chat/:provider', async function(req, res) {
-    var provider = req.params.provider;
-    var message = req.body.message;
-    var auth = req.headers.authorization;
-
-    if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing API key' });
-    var key = auth.replace('Bearer ', '');
-    var kd = apiKeys.get(key);
-    if (!kd || kd.revoked) return res.status(403).json({ error: 'Invalid or revoked key' });
-    if (!PROVIDERS[provider]) return res.status(400).json({ error: 'Unknown provider', available: Object.keys(PROVIDERS) });
-    if (!pages[provider]) return res.status(503).json({ error: provider + ' not connected. Initialize first.' });
-    if (busy[provider]) return res.status(429).json({ error: provider + ' is busy. Try again.' });
-    if (!message) return res.status(400).json({ error: 'No message' });
-
-    busy[provider] = true;
-    var start = Date.now();
-    try {
-        var reply = await SENDERS[provider](pages[provider], message);
-        await saveCookies(provider);
-        kd.calls++;
-        if (kd.providers.indexOf(provider) === -1) kd.providers.push(provider);
-        pState[provider].requests++;
-        res.json({ provider: provider, model: PROVIDERS[provider].name, reply: reply, latency: (Date.now() - start) + 'ms' });
-    } catch(err) {
-        stats.errors++;
-        res.status(500).json({ error: err.message });
-    } finally { busy[provider] = false; }
-});
-
-// ═══════════════════════════════════════
-// HTML DASHBOARD
-// ═══════════════════════════════════════
-
-function HTML() {
-    return '<!DOCTYPE html>\n<html lang="en">\n<head>\n' +
-    '<meta charset="UTF-8">\n' +
-    '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
-    '<link rel="icon" href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' viewBox=\'0 0 100 100\'><text y=\'.9em\' font-size=\'90\'>N</text></svg>">\n' +
-    '<title>Nova API — Dashboard</title>\n' +
-    '<style>\n' +
-    '*{margin:0;padding:0;box-sizing:border-box}\n' +
-    ':root{--bg:#08080c;--surface:#0e0e14;--card:#111118;--border:#1a1a2e;--border2:#252540;--text:#e0e0e0;--muted:#666;--blue:#1CB7FF;--green:#2FF58B;--red:#ef4444;--amber:#f59e0b}\n' +
-    'body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}\n' +
-    '.app{display:flex;min-height:100vh}\n' +
-    '.sidebar{width:240px;background:var(--surface);border-right:1px solid var(--border);padding:20px 0;position:fixed;height:100vh;display:flex;flex-direction:column;z-index:100}\n' +
-    '.main{margin-left:240px;flex:1}\n' +
-    '.sb-logo{display:flex;align-items:center;gap:10px;padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}\n' +
-    '.sb-logo .icon{width:34px;height:34px;background:linear-gradient(135deg,var(--blue),var(--green));border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#000}\n' +
-    '.sb-logo span{font-size:18px;font-weight:700;background:linear-gradient(90deg,var(--blue),var(--green));-webkit-background-clip:text;-webkit-text-fill-color:transparent}\n' +
-    '.sb-nav{flex:1;overflow-y:auto;padding:0 10px}\n' +
-    '.sb-section{font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);padding:16px 10px 6px;font-weight:600}\n' +
-    '.sb-link{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;color:#888;font-size:13.5px;cursor:pointer;transition:all .15s;text-decoration:none;font-weight:500}\n' +
-    '.sb-link:hover{background:#1a1a2e;color:#ccc}\n' +
-    '.sb-link.active{background:linear-gradient(135deg,#1CB7FF11,#2FF58B08);color:#fff;border:1px solid #1CB7FF22}\n' +
-    '.sb-link .badge{margin-left:auto;background:var(--green);color:#000;font-size:10px;padding:1px 6px;border-radius:10px;font-weight:700}\n' +
-    '.topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;border-bottom:1px solid var(--border);background:var(--surface);position:sticky;top:0;z-index:50}\n' +
-    '.topbar h2{font-size:18px;font-weight:700}\n' +
-    '.topbar-right{display:flex;align-items:center;gap:12px}\n' +
-    '.pill{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;background:#10a37f18;color:#10a37f;border:1px solid #10a37f33}\n' +
-    '.pill .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}\n' +
-    '@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}\n' +
-    '.btn{padding:9px 18px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit}\n' +
-    '.btn-primary{background:linear-gradient(135deg,var(--blue),var(--green));color:#000}\n' +
-    '.btn-primary:hover{opacity:.85}\n' +
-    '.btn-danger{background:#ef444422;color:#ef4444;border:1px solid #ef444433}\n' +
-    '.btn-danger:hover{background:#ef444433}\n' +
-    '.btn-outline{background:transparent;border:1px solid var(--border2);color:#aaa}\n' +
-    '.btn-outline:hover{border-color:var(--blue);color:var(--blue)}\n' +
-    '.btn-sm{padding:6px 12px;font-size:11.5px}\n' +
-    '.btn-xs{padding:4px 8px;font-size:10.5px;border-radius:6px}\n' +
-    '.btn:disabled{opacity:.4;cursor:not-allowed}\n' +
-    '.content{padding:24px 28px}\n' +
-    '.page{display:none}\n' +
-    '.page.active{display:block}\n' +
-    '.stats-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px;margin-bottom:24px}\n' +
-    '.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px}\n' +
-    '.stat-card .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;font-weight:600}\n' +
-    '.stat-card .value{font-size:28px;font-weight:800;background:linear-gradient(90deg,var(--blue),var(--green));-webkit-background-clip:text;-webkit-text-fill-color:transparent}\n' +
-    '.stat-card .sub{font-size:11px;color:#555;margin-top:4px}\n' +
-    '.section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}\n' +
-    '.section-head h3{font-size:16px;font-weight:700}\n' +
-    '.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:24px}\n' +
-    '.p-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;transition:all .2s}\n' +
-    '.p-card:hover{border-color:var(--border2);transform:translateY(-2px)}\n' +
-    '.p-card-head{display:flex;align-items:center;gap:12px;margin-bottom:12px}\n' +
-    '.p-card-icon{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:16px;color:#000;flex-shrink:0}\n' +
-    '.p-card-name{font-size:15px;font-weight:700}\n' +
-    '.p-card-desc{font-size:12px;color:var(--muted)}\n' +
-    '.p-card-status{display:flex;align-items:center;gap:6px;font-size:12px;margin:12px 0;font-weight:500}\n' +
-    '.p-card-status.connected{color:var(--green)}\n' +
-    '.p-card-status.disconnected{color:#666}\n' +
-    '.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}\n' +
-    '.status-dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}\n' +
-    '.status-dot.off{background:#555}\n' +
-    '.p-card-meta{font-size:11px;color:#444;margin-bottom:12px}\n' +
-    '.p-card-actions{display:flex;gap:8px;flex-wrap:wrap}\n' +
-    '.p-card-actions .btn:disabled{opacity:.5}\n' +
-    '.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;margin-bottom:24px}\n' +
-    'table{width:100%;border-collapse:collapse}\n' +
-    'th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);font-weight:600;padding:12px 16px;border-bottom:1px solid var(--border);background:#0c0c14}\n' +
-    'td{padding:11px 16px;font-size:13px;border-bottom:1px solid #111120}\n' +
-    'tr:last-child td{border-bottom:none}\n' +
-    '.mono{font-family:SF Mono,Monaco,Consolas,monospace;font-size:12px}\n' +
-    '.copy-btn{background:none;border:none;color:#555;cursor:pointer;padding:4px;font-size:13px;transition:color .15s;vertical-align:middle}\n' +
-    '.copy-btn:hover{color:var(--blue)}\n' +
-    '.copy-btn.copied{color:var(--green)}\n' +
-    '.chat-container{display:flex;flex-direction:column;height:calc(100vh - 140px)}\n' +
-    '.chat-header{display:flex;align-items:center;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:16px;flex-shrink:0;flex-wrap:wrap}\n' +
-    '.chat-header select{background:var(--card);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:8px;font-size:13px;outline:none;cursor:pointer}\n' +
-    '.chat-messages{flex:1;overflow-y:auto;padding-right:8px}\n' +
-    '.msg{margin-bottom:12px;max-width:80%;padding:10px 14px;border-radius:12px;font-size:13.5px;line-height:1.65;white-space:pre-wrap;word-wrap:break-word;position:relative}\n' +
-    '.msg-user{background:linear-gradient(135deg,#1CB7FF15,#2FF58B08);border:1px solid #1CB7FF20;margin-left:auto;text-align:right;border-bottom-right-radius:4px}\n' +
-    '.msg-bot{background:var(--card);border:1px solid var(--border);border-bottom-left-radius:4px}\n' +
-    '.msg-system{text-align:center;color:#555;font-size:12px;font-style:italic;max-width:100%}\n' +
-    '.msg-error{text-align:center;color:var(--red);font-size:12.5px;max-width:100%;background:#ef444411;border:1px solid #ef444422;border-radius:8px;padding:8px 14px}\n' +
-    '.msg-meta{font-size:10px;color:#444;margin-top:4px}\n' +
-    '.msg-copy{position:absolute;top:8px;right:8px;opacity:0;transition:opacity .15s}\n' +
-    '.msg:hover .msg-copy{opacity:1}\n' +
-    '.chat-input-wrap{display:flex;gap:10px;padding-top:16px;border-top:1px solid var(--border);flex-shrink:0}\n' +
-    '.chat-input-wrap textarea{flex:1;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--text);font-size:13.5px;font-family:inherit;resize:none;height:44px;outline:none;transition:border-color .15s}\n' +
-    '.chat-input-wrap textarea:focus{border-color:var(--blue)}\n' +
-    '.spinner{display:inline-block;width:13px;height:13px;border:2px solid #1CB7FF44;border-top:2px solid var(--blue);border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}\n' +
-    '@keyframes spin{to{transform:rotate(360deg)}}\n' +
-    '.doc-block{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:12px}\n' +
-    '.doc-block .endpoint{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}\n' +
-    '.method{padding:3px 10px;border-radius:5px;font-weight:700;font-size:11px;letter-spacing:.5px}\n' +
-    '.m-get{background:#10a37f22;color:#10a37f}\n' +
-    '.m-post{background:#2563eb22;color:#60a5fa}\n' +
-    '.m-delete{background:#ef444422;color:#ef4444}\n' +
-    '.doc-block code{background:#1a1a28;padding:3px 7px;border-radius:5px;font-size:12px;font-family:monospace;color:#ccc}\n' +
-    '.doc-block .desc{font-size:13px;color:#888;line-height:1.6}\n' +
-    '.doc-block .example{background:#0a0a10;border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:10px;font-family:monospace;font-size:12px;color:#aaa;line-height:1.7;white-space:pre;overflow-x:auto}\n' +
-    '.toast{position:fixed;bottom:24px;right:24px;background:var(--card);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:13px;display:none;z-index:999;animation:fadeIn .2s;max-width:400px;word-wrap:break-word}\n' +
-    '@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}\n' +
-    '@media(max-width:768px){.sidebar{width:60px;padding:12px 0}.sb-logo span,.sb-link span,.sb-section{display:none}.sb-link{justify-content:center;padding:10px}.sb-link .badge{display:none}.main{margin-left:60px}.stats-row{grid-template-columns:1fr 1fr}.provider-grid{grid-template-columns:1fr}}\n' +
-    '</style>\n</head>\n<body>\n' +
-    '<div class="app">\n' +
-
-    // SIDEBAR
-    '<div class="sidebar">\n' +
-    '  <div class="sb-logo"><div class="icon">N</div><span>Nova API</span></div>\n' +
-    '  <div class="sb-nav">\n' +
-    '    <div class="sb-section">Overview</div>\n' +
-    '    <a class="sb-link active" data-page="dashboard" onclick="switchPage(\'dashboard\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>\n' +
-    '      <span>Dashboard</span>\n' +
-    '    </a>\n' +
-    '    <a class="sb-link" data-page="providers" onclick="switchPage(\'providers\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 6v6m-7-7H1m22 0h-4m-1.5-7.5L15 7m-6 10l-2.5 2.5M19.5 19.5L17 17M5 5l2.5 2.5"/></svg>\n' +
-    '      <span>Providers</span>\n' +
-    '      <span class="badge" id="connBadge">0</span>\n' +
-    '    </a>\n' +
-    '    <div class="sb-section">Management</div>\n' +
-    '    <a class="sb-link" data-page="keys" onclick="switchPage(\'keys\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>\n' +
-    '      <span>API Keys</span>\n' +
-    '    </a>\n' +
-    '    <div class="sb-section">Tools</div>\n' +
-    '    <a class="sb-link" data-page="playground" onclick="switchPage(\'playground\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>\n' +
-    '      <span>Playground</span>\n' +
-    '    </a>\n' +
-    '    <a class="sb-link" data-page="docs" onclick="switchPage(\'docs\')">\n' +
-    '      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>\n' +
-    '      <span>API Docs</span>\n' +
-    '    </a>\n' +
-    '  </div>\n' +
-    '</div>\n' +
-
-    // MAIN
-    '<div class="main">\n' +
-    '  <div class="topbar">\n' +
-    '    <h2 id="pageTitle">Dashboard</h2>\n' +
-    '    <div class="topbar-right">\n' +
-    '      <div class="pill"><span class="dot"></span><span id="connCount">0</span> Connected</div>\n' +
-    '    </div>\n' +
-    '  </div>\n' +
-    '  <div class="content">\n' +
-
-    // DASHBOARD
-    '    <div class="page active" id="page-dashboard">\n' +
-    '      <div class="stats-row" id="statsRow"></div>\n' +
-    '      <div class="section-head"><h3>Provider Status</h3></div>\n' +
-    '      <div class="provider-grid" id="dashProviders"></div>\n' +
-    '    </div>\n' +
-
-    // PROVIDERS
-    '    <div class="page" id="page-providers">\n' +
-    '      <div class="section-head"><h3>AI Providers</h3><span id="provCountLabel" style="font-size:12px;color:var(--muted)"></span></div>\n' +
-    '      <div class="provider-grid" id="providerGrid"></div>\n' +
-    '    </div>\n' +
-
-    // KEYS
-    '    <div class="page" id="page-keys">\n' +
-    '      <div class="section-head"><h3>API Keys</h3><button class="btn btn-primary btn-sm" onclick="generateKey()">+ New Key</button></div>\n' +
-    '      <div class="table-wrap"><table><thead><tr><th>Key</th><th>Created</th><th>Calls</th><th>Providers</th><th>Status</th><th>Actions</th></tr></thead>\n' +
-    '      <tbody id="keysBody"><tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet.</td></tr></tbody></table></div>\n' +
-    '    </div>\n' +
-
-    // PLAYGROUND
-    '    <div class="page" id="page-playground">\n' +
-    '      <div class="chat-container">\n' +
-    '        <div class="chat-header">\n' +
-    '          <select id="chatProv"></select>\n' +
-    '          <button class="btn btn-outline btn-sm" onclick="newChat()">New Chat</button>\n' +
-    '          <button class="btn btn-outline btn-sm" onclick="clearChat()">Clear</button>\n' +
-    '        </div>\n' +
-    '        <div class="chat-messages" id="chatBox"><div class="msg msg-system">Select a connected provider and start chatting.</div></div>\n' +
-    '        <div class="chat-input-wrap">\n' +
-    '          <textarea id="chatInput" placeholder="Type a message..." rows="1"></textarea>\n' +
-    '          <button class="btn btn-primary" id="sendBtn" onclick="sendMsg()">Send</button>\n' +
-    '        </div>\n' +
-    '      </div>\n' +
-    '    </div>\n' +
-
-    // DOCS
-    '    <div class="page" id="page-docs">\n' +
-    '      <div class="section-head"><h3>API Reference</h3></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/keys</code></div><div class="desc">Generate a new API key.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/keys</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/providers</code></div><div class="desc">List providers with connection status and uptime.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/init</code></div><div class="desc">Connect to a provider (launches browser). Providers: chatgpt, claude, gemini, perplexity.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/chat/:provider</code></div><div class="desc">Send a message. Requires Authorization header.</div><div class="example">curl -X POST https://your-app.onrender.com/v1/chat/chatgpt \\\n  -H "Authorization: Bearer sk-nova-YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"message": "Hello!"}\'\n\n// Response:\n{ "provider": "chatgpt", "model": "ChatGPT",\n  "reply": "Hi there!", "latency": "3200ms" }</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-post">POST</span> <code>/v1/providers/:provider/newchat</code></div><div class="desc">Start a fresh conversation.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-delete">DELETE</span> <code>/v1/keys/:key</code></div><div class="desc">Revoke an API key.</div></div>\n' +
-    '      <div class="doc-block"><div class="endpoint"><span class="method m-get">GET</span> <code>/v1/stats</code></div><div class="desc">Platform statistics.</div></div>\n' +
-    '    </div>\n' +
-
-    '  </div>\n</div>\n</div>\n' +
-    '<div class="toast" id="toast"></div>\n' +
-
-    // JS
-    '<script>\n' +
-    'var myKey=localStorage.getItem("nova_key")||"",providers={},keys=[];\n' +
-    'var titles={dashboard:"Dashboard",providers:"Providers",keys:"API Keys",playground:"Playground",docs:"API Documentation"};\n' +
-
-    'function switchPage(p){\n' +
-    '  document.querySelectorAll(".page").forEach(function(e){e.classList.remove("active")});\n' +
-    '  document.getElementById("page-"+p).classList.add("active");\n' +
-    '  document.querySelectorAll(".sb-link").forEach(function(e){e.classList.remove("active")});\n' +
-    '  var l=document.querySelector("[data-page=\\""+p+"\\"]");\n' +
-    '  if(l)l.classList.add("active");\n' +
-    '  document.getElementById("pageTitle").textContent=titles[p];\n' +
-    '  if(p==="keys")loadKeys();\n' +
-    '  if(p==="providers"||p==="dashboard")loadProviders();\n' +
-    '}\n' +
-
-    'function showToast(m,c){var t=document.getElementById("toast");t.textContent=m;t.style.color=c||"var(--green)";t.style.display="block";clearTimeout(t._t);t._t=setTimeout(function(){t.style.display="none"},3000)}\n' +
-
-    'function copyText(text,btn){navigator.clipboard.writeText(text).then(function(){if(btn){btn.classList.add("copied");btn.textContent="\\u2713";setTimeout(function(){btn.classList.remove("copied");btn.textContent="\\ud83d\\udccb"},1500)}showToast("Copied")}).catch(function(){showToast("Copy failed","var(--red)")})}\n' +
-
-    'function fmtUptime(s){if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m "+(s%60)+"s";return Math.floor(s/3600)+"h "+Math.floor((s%3600)/60)+"m"}\n' +
-    'function fmtDate(ts){var d=new Date(ts);return d.toLocaleDateString("en-US",{month:"short",day:"numeric"})+" "+d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"})}\n' +
-
-    'async function loadProviders(){\n' +
-    '  try{\n' +
-    '    var res=await fetch("/v1/providers");\n' +
-    '    providers=await res.json();\n' +
-    '    var conn=0;Object.keys(providers).forEach(function(id){if(providers[id].connected)conn++});\n' +
-    '    document.getElementById("connCount").textContent=conn;\n' +
-    '    document.getElementById("connBadge").textContent=conn;\n' +
-    '    renderCards("dashProviders",true);\n' +
-    '    renderCards("providerGrid",false);\n' +
-    '    var sel=document.getElementById("chatProv"),cur=sel.value;\n' +
-    '    sel.innerHTML="";\n' +
-    '    Object.keys(providers).forEach(function(id){var o=document.createElement("option");o.value=id;o.textContent=providers[id].name+(providers[id].connected?" \\u2713":"");sel.appendChild(o)});\n' +
-    '    if(cur)sel.value=cur;\n' +
-    '  }catch(e){}\n' +
-    '}\n' +
-
-    'function renderCards(cid,compact){\n' +
-    '  var g=document.getElementById(cid);if(!g)return;\n' +
-    '  g.innerHTML="";\n' +
-    '  Object.keys(providers).forEach(function(id){\n' +
-    '    var p=providers[id],c=document.createElement("div");\n' +
-    '    c.className="p-card";\n' +
-    '    var isC=p.connected;\n' +
-    '    var sClass=isC?"connected":"disconnected";\n' +
-    '    var sText=isC?"Connected \\u2022 up "+fmtUptime(p.uptime):"Disconnected";\n' +
-    '    c.innerHTML=\'<div class="p-card-head"><div class="p-card-icon" style="background:\'+p.color+\'">\'+p.icon+\'</div><div><div class="p-card-name">\'+p.name+\'</div><div class="p-card-desc">\'+p.desc+\'</div></div></div>\'+\n' +
-    '      \'<div class="p-card-status \'+sClass+\'"><span class="status-dot \'+(isC?"on":"off")+\'"></span>\'+sText+\'</div>\'+\n' +
-    '      (compact?\'\':\'<div class="p-card-meta">\'+p.requests+\' requests</div><div class="p-card-actions">\'+\n' +
-    '        (isC?\'<button class="btn btn-outline btn-sm" onclick="initProv(\\\'\'+id+\'\\\')">Reconnect</button><button class="btn btn-outline btn-sm" onclick="switchPage(\\\'playground\\\')">Chat</button>\':\'<button class="btn btn-primary btn-sm" onclick="initProv(\\\'\'+id+\'\\\')">Connect</button>\')+\'</div>\');\n' +
-    '    g.appendChild(c);\n' +
-    '  });\n' +
-    '  var l=document.getElementById("provCountLabel");if(l)l.textContent=Object.keys(providers).length+" providers";\n' +
-    '}\n' +
-
-    'async function initProv(id){\n' +
-    '  showToast("Connecting to "+id+"... this may take 15-30s","var(--amber)");\n' +
-    '  try{\n' +
-    '    var res=await fetch("/v1/providers/"+id+"/init",{method:"POST"});\n' +
-    '    var d=await res.json();\n' +
-    '    if(d.error)showToast("Error: "+d.error,"var(--red)");\n' +
-    '    else showToast(id+" connected!");\n' +
-    '  }catch(e){showToast("Failed: "+e.message,"var(--red)")}\n' +
-    '  loadProviders();loadStats();\n' +
-    '}\n' +
-
-    'async function loadStats(){\n' +
-    '  try{\n' +
-    '    var res=await fetch("/v1/stats");\n' +
-    '    var s=await res.json();\n' +
-    '    document.getElementById("statsRow").innerHTML=\n' +
-    '      \'<div class="stat-card"><div class="label">Total Requests</div><div class="value">\'+s.totalCalls+\'</div><div class="sub">All time</div></div>\'+\n' +
-    '      \'<div class="stat-card"><div class="label">Active Keys</div><div class="value">\'+s.activeKeys+\'</div><div class="sub">\'+s.totalKeys+\' total</div></div>\'+\n' +
-    '      \'<div class="stat-card"><div class="label">Connected</div><div class="value">\'+s.connectedProviders+\'</div><div class="sub">of 4 providers</div></div>\'+\n' +
-    '      \'<div class="stat-card"><div class="label">Uptime</div><div class="value">\'+fmtUptime(s.uptime)+\'</div><div class="sub">\'+s.errors+\' errors</div></div>\';\n' +
-    '  }catch(e){}\n' +
-    '}\n' +
-
-    'async function generateKey(){var r=await fetch("/v1/keys",{method:"POST"});var d=await r.json();myKey=d.key;localStorage.setItem("nova_key",myKey);showToast("Key generated!");loadKeys()}\n' +
-
-    'async function loadKeys(){\n' +
-    '  try{\n' +
-    '    var res=await fetch("/v1/keys");\n' +
-    '    keys=await res.json();\n' +
-    '    var b=document.getElementById("keysBody");\n' +
-    '    if(!keys.length){b.innerHTML=\'<tr><td colspan="6" style="text-align:center;color:#555;padding:30px">No keys yet.</td></tr>\';return}\n' +
-    '    b.innerHTML="";\n' +
-    '    keys.forEach(function(k){\n' +
-    '      var tr=document.createElement("tr");\n' +
-    '      var tags=k.providers.map(function(p){var col=providers[p]?providers[p].color:"#555";return \'<span style="background:\'+col+\'22;color:\'+col+\';padding:2px 7px;border-radius:4px;font-size:10px;margin-right:4px">\'+p+\'</span>\'}).join("")||\'<span style="color:#444">\\u2014</span>\';\n' +
-    '      tr.innerHTML=\'<td><span class="mono">\'+k.key+\'</span> <button class="copy-btn" onclick="copyText(\\\'\'+k.full+\'\\\',this)">\\ud83d\\udccb</button></td>\'+\n' +
-    '        \'<td>\'+fmtDate(new Date(k.created).getTime())+\'</td>\'+\n' +
-    '        \'<td style="font-weight:600">\'+k.calls+\'</td>\'+\n' +
-    '        \'<td>\'+tags+\'</td>\'+\n' +
-    '        \'<td>\'+(k.revoked?\'<span style="color:var(--red)">Revoked</span>\':\'<span style="color:var(--green)">Active</span>\')+\'</td>\'+\n' +
-    '        \'<td>\'+(k.revoked?\'\\u2014\':\'<button class="btn btn-danger btn-xs" onclick="revokeKey(\\\'\'+k.full+\'\\\')">Revoke</button>\')+\'</td>\';\n' +
-    '      b.appendChild(tr);\n' +
-    '    });\n' +
-    '  }catch(e){}\n' +
-    '}\n' +
-
-    'async function revokeKey(k){if(!confirm("Revoke this key?"))return;await fetch("/v1/keys/"+k,{method:"DELETE"});showToast("Revoked");loadKeys();loadStats()}\n' +
-
-    'var chatBox,chatInput,sendBtn;\n' +
-    'document.addEventListener("DOMContentLoaded",function(){\n' +
-    '  chatBox=document.getElementById("chatBox");\n' +
-    '  chatInput=document.getElementById("chatInput");\n' +
-    '  sendBtn=document.getElementById("sendBtn");\n' +
-    '  chatInput.addEventListener("keydown",function(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMsg()}});\n' +
-    '  chatInput.addEventListener("input",function(){chatInput.style.height="auto";chatInput.style.height=Math.min(chatInput.scrollHeight,120)+"px"});\n' +
-    '});\n' +
-
-    'function addMsg(text,cls,meta){\n' +
-    '  var d=document.createElement("div");d.className="msg "+cls;\n' +
-    '  if(cls==="msg-bot"||cls==="msg-user"){\n' +
-    '    d.innerHTML=text.replace(/</g,"&lt;").replace(/>/g,"&gt;")+\' <button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\'+(meta?\'<div class="msg-meta">\'+meta+\'</div>\':\'\');\n' +
-    '  }else{d.textContent=text}\n' +
-    '  chatBox.appendChild(d);chatBox.scrollTop=chatBox.scrollHeight;return d;\n' +
-    '}\n' +
-
-    'async function sendMsg(){\n' +
-    '  if(!myKey){showToast("Generate an API key first","var(--red)");switchPage("keys");return}\n' +
-    '  var text=chatInput.value.trim();if(!text)return;\n' +
-    '  var prov=document.getElementById("chatProv").value;\n' +
-    '  addMsg(text,"msg-user");chatInput.value="";chatInput.style.height="44px";\n' +
-    '  sendBtn.disabled=true;\n' +
-    '  var think=addMsg("","msg-bot");\n' +
-    '  think.innerHTML=\'<span class="spinner"></span> Querying \'+prov+\'...\';\n' +
-    '  try{\n' +
-    '    var res=await fetch("/v1/chat/"+prov,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+myKey},body:JSON.stringify({message:text})});\n' +
-    '    var d=await res.json();\n' +
-    '    if(d.error){\n' +
-    '      think.className="msg msg-error";\n' +
-    '      think.innerHTML="Error: "+d.error.replace(/</g,"&lt;")+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\';\n' +
-    '    }else{\n' +
-    '      think.className="msg msg-bot";\n' +
-    '      think.innerHTML=d.reply.replace(/</g,"&lt;").replace(/>/g,"&gt;")+\' <button class="copy-btn msg-copy" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button><div class="msg-meta">\'+d.model+" \\u00b7 "+d.latency+\'</div>\';\n' +
-    '    }\n' +
-    '  }catch(e){think.className="msg msg-error";think.innerHTML="Network error: "+e.message+\' <button class="copy-btn" onclick="copyText(this.parentElement.textContent.trim(),this)">\\ud83d\\udccb</button>\'}\n' +
-    '  sendBtn.disabled=false;chatInput.focus();loadStats();\n' +
-    '}\n' +
-
-    'async function newChat(){var p=document.getElementById("chatProv").value;await fetch("/v1/providers/"+p+"/newchat",{method:"POST"});clearChat();addMsg("New chat on "+p,"msg-system")}\n' +
-    'function clearChat(){chatBox.innerHTML=""}\n' +
-
-    'loadProviders();loadStats();loadKeys();setInterval(function(){loadProviders();loadStats()},15000);\n' +
-    '</script>\n</body>\n</html>';
+  } catch (e) {}
 }
 
-// ═══════════════════════════════════════
-// START
-// ═══════════════════════════════════════
-var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() {
-    console.log('');
-    console.log('  Nova API Gateway v2.0 (Playwright + Firefox)');
-    console.log('  http://localhost:' + PORT);
-    console.log('  Providers: ' + Object.keys(PROVIDERS).join(', '));
-    console.log('');
-});
+async function bvClick(event) {
+  if (!bvProvider) return;
+  const img = document.getElementById('bv-img');
+  const rect = img.getBoundingClientRect();
+  const x = Math.round((event.clientX - rect.left) / rect.width * 1280);
+  const y = Math.round((event.clientY - rect.top) / rect.height * 800);
+
+  // Show click ring
+  const ring = document.createElement('div');
+  ring.className = 'click-ring';
+  ring.style.left = (event.clientX - rect.left) + 'px';
+  ring.style.top = (event.clientY - rect.top) + 'px';
+  document.getElementById('bv-screen').appendChild(ring);
+  setTimeout(() => ring.remove(), 500);
+
+  try {
+    const r = await fetch('/v1/providers/' + bvProvider + '/click', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ x, y })
+    });
+    const d = await r.json();
+    if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
+    if (d.message) document.getElementById('bv-msg').textContent = d.message;
+    if (d.state === 'connected') {
+      document.getElementById('bv-dot').className = 'dot green';
+      loadProviders();
+    } else {
+      document.getElementById('bv-dot').className = 'dot yellow';
+    }
+  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
+}
+
+async function bvSubmit() {
+  if (!bvProvider) return;
+  const input = document.getElementById('bv-input');
+  const val = input.value.trim();
+  if (!val) return;
+
+  // Detect what type of field we're filling
+  const msg = document.getElementById('bv-msg').textContent.toLowerCase();
+  let fieldType = 'text';
+  if (msg.includes('email')) fieldType = 'email';
+  else if (msg.includes('password')) fieldType = 'password';
+  else if (msg.includes('code') || msg.includes('verification')) fieldType = 'code';
+
+  try {
+    if (fieldType !== 'text') {
+      // Use login endpoint
+      const r = await fetch('/v1/providers/' + bvProvider + '/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fieldType, value: val })
+      });
+      const d = await r.json();
+      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
+      if (d.message) document.getElementById('bv-msg').textContent = d.message;
+      if (d.state === 'connected') {
+        document.getElementById('bv-dot').className = 'dot green';
+        loadProviders();
+      } else {
+        document.getElementById('bv-dot').className = 'dot yellow';
+      }
+    } else {
+      // Use type endpoint
+      const r = await fetch('/v1/providers/' + bvProvider + '/type', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: val })
+      });
+      const d = await r.json();
+      if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
+    }
+    input.value = '';
+  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
+}
+
+async function bvSendKey(key) {
+  if (!bvProvider) return;
+  try {
+    const r = await fetch('/v1/providers/' + bvProvider + '/key', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key })
+    });
+    const d = await r.json();
+    if (d.screenshot) document.getElementById('bv-img').src = 'data:image/jpeg;base64,' + d.screenshot;
+    if (d.message) document.getElementById('bv-msg').textContent = d.message;
+    if (d.state === 'connected') {
+      document.getElementById('bv-dot').className = 'dot green';
+      loadProviders();
+    }
+  } catch (e) { document.getElementById('bv-msg').textContent = 'Error: ' + e.message; }
+}
+
+// ====== CHAT ======
+async function sendMsg() {
+  const input = document.getElementById('chat-input');
+  const provider = document.getElementById('pg-provider').value;
+  const msg = input.value.trim();
+  if (!msg || !provider) return;
+
+  const msgs = document.getElementById('chat-msgs');
+  msgs.innerHTML += '<div class="msg user"><div class="label">You</div><div class="bubble">' + escHtml(msg) + '</div></div>';
+  msgs.innerHTML += '<div class="msg ai" id="thinking"><div class="label">' + provider + '</div><div class="bubble"><span class="spinner"></span> Thinking...</div></div>';
+  msgs.scrollTop = msgs.scrollHeight;
+  input.value = '';
+
+  try {
+    const r = await fetch('/v1/chat/' + provider, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg })
+    });
+    const d = await r.json();
+    const thinking = document.getElementById('thinking');
+    if (thinking) thinking.remove();
+    const reply = d.error ? 'Error: ' + d.error : (d.choices && d.choices[0] ? d.choices[0].message.content : 'No response');
+    msgs.innerHTML += '<div class="msg ai"><div class="label">' + provider + '</div><div class="bubble">' + escHtml(reply) + '</div></div>';
+  } catch (e) {
+    const thinking = document.getElementById('thinking');
+    if (thinking) thinking.remove();
+    msgs.innerHTML += '<div class="msg ai"><div class="label">Error</div><div class="bubble" style="color:var(--red)">' + escHtml(e.message) + '</div></div>';
+  }
+  msgs.scrollTop = msgs.scrollHeight;
+  loadProviders();
+}
+
+function clearChat() { document.getElementById('chat-msgs').innerHTML = ''; }
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ====== KEYS ======
+async function loadKeys() {
+  try {
+    const r = await fetch('/v1/keys');
+    const keys = await r.json();
+    const body = document.getElementById('keys-body');
+    body.innerHTML = keys.length ? keys.map(k =>
+      '<tr><td>' + escHtml(k.name) + '</td><td><span class="key-value">' + k.key + '</span></td><td>' + new Date(k.created).toLocaleDateString() + '</td><td>' + k.requests + '</td><td><button class="btn btn-danger btn-sm" onclick="revokeKey(\\'' + k.fullKey + '\\')">Revoke</button></td></tr>'
+    ).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--dim);padding:30px">No API keys yet. Click "Generate Key" to create one.</td></tr>';
+    document.getElementById('ov-keys').textContent = keys.length;
+  } catch (e) {}
+}
+
+async function genKey() {
+  const name = prompt('Key name:');
+  if (!name) return;
+  try {
+    const r = await fetch('/v1/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    const d = await r.json();
+    alert('Key created: ' + d.key + '\\n\\nSave it now — it won\\'t be shown in full again.');
+    loadKeys();
+  } catch (e) { alert(e.message); }
+}
+
+async function revokeKey(key) {
+  if (!confirm('Revoke this key?')) return;
+  try { await fetch('/v1/keys/' + encodeURIComponent(key), { method: 'DELETE' }); loadKeys(); } catch (e) { alert(e.message); }
+}
+
+// ====== STATS ======
+async function loadStats() {
+  try {
+    const r = await fetch('/v1/stats');
+    const s = await r.json();
+    document.getElementById('ov-requests').textContent = s.totalRequests;
+  } catch (e) {}
+}
+
+// ====== INIT ======
+loadProviders();
+setInterval(loadProviders, 15000);
+</script>
+</body>
+</html>`;
+
+// ====== START ======
+app.listen(PORT, () => { console.log('Nova API Gateway v3 on port ' + PORT); });
+
+process.on('SIGTERM', async () => { if (browser) await browser.close().catch(() => {}); process.exit(0); });
